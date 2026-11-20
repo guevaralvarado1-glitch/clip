@@ -61,7 +61,7 @@ export const ScriptGeneratorView: React.FC<ScriptGeneratorViewProps> = ({
     try {
       setError(null);
       setLoading(true);
-      const res = await apiFetch('/api/ai/storyboard', {
+      const startRes = await apiFetch('/api/ai/storyboard/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -74,9 +74,35 @@ export const ScriptGeneratorView: React.FC<ScriptGeneratorViewProps> = ({
           language,
         }),
       });
-      const data = await safeJson(res);
-      if (!res.ok) {
-        throw new Error(data.error || 'Error al generar el storyboard.');
+      const startData = await safeJson<{ jobId?: string; error?: string }>(startRes);
+      if (!startRes.ok || !startData.jobId) {
+        throw new Error(startData.error || 'Error al iniciar la generación del storyboard.');
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let data: any = null;
+      for (let attempt = 0; attempt < 120; attempt++) {
+        await new Promise((r) => window.setTimeout(r, 1500));
+        const statusRes = await apiFetch(`/api/ai/storyboard/${startData.jobId}/status`);
+        const statusData = await safeJson<{
+          status?: 'running' | 'done' | 'error';
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          data?: any;
+          error?: string;
+        }>(statusRes);
+        if (!statusRes.ok) {
+          throw new Error(statusData.error || 'Error consultando el storyboard.');
+        }
+        if (statusData.status === 'error') {
+          throw new Error(statusData.error || 'Error al generar el storyboard.');
+        }
+        if (statusData.status === 'done' && statusData.data) {
+          data = statusData.data;
+          break;
+        }
+      }
+      if (!data) {
+        throw new Error('La generación del storyboard tardó demasiado en completarse.');
       }
 
       const generatedScenes: Scene[] = (data.scenes || []).map(

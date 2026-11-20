@@ -11,11 +11,15 @@ export async function apiFetch(
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const startedAt = Date.now();
     try {
       const res = await fetch(input, init);
+      const elapsedMs = Date.now() - startedAt;
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       const isProxyWakeupError =
-        RETRYABLE_PROXY_STATUSES.has(res.status) && !contentType.includes('application/json');
+        RETRYABLE_PROXY_STATUSES.has(res.status) &&
+        !contentType.includes('application/json') &&
+        elapsedMs < 15000;
 
       if (isProxyWakeupError && attempt < maxRetries) {
         await new Promise((r) => window.setTimeout(r, 1500 * (attempt + 1)));
@@ -53,7 +57,7 @@ export async function safeJson<T = any>(res: Response): Promise<T> {
     }
     if (res.status === 404) {
       throw new Error(
-        'El servidor se está reiniciando o despertando (HTTP 404). Recarga la página o intenta de nuevo en unos segundos.'
+        'La petición no recibió respuesta válida a tiempo o el servidor se está reiniciando (HTTP 404). Intenta de nuevo en unos segundos.'
       );
     }
     if (res.status === 504 || res.status === 502 || res.status === 503 || raw.includes('The page c')) {

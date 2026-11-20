@@ -79,6 +79,54 @@ function formatAiError(error: unknown, fallback: string): string {
   return raw || fallback;
 }
 
+async function generateWithFallback(
+  ai: GoogleGenAI,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  contents: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  responseSchema?: any,
+  timeoutMs = 15000
+): Promise<string> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const buildConfig = (level: ThinkingLevel): any => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const cfg: any = { thinkingConfig: { thinkingLevel: level } };
+    if (responseSchema) {
+      cfg.responseMimeType = 'application/json';
+      cfg.responseSchema = responseSchema;
+    }
+    return cfg;
+  };
+
+  try {
+    const primaryPromise = ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents,
+      config: buildConfig(ThinkingLevel.LOW),
+    });
+    const timeoutPromise = new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error('ETIMEDOUT_PRIMARY_MODEL')), timeoutMs)
+    );
+    const resp = await Promise.race([primaryPromise, timeoutPromise]);
+    return (resp.text ?? '').trim();
+  } catch (primaryErr) {
+    const msg = primaryErr instanceof Error ? primaryErr.message : '';
+    if (!isTransientAiError(primaryErr) && msg !== 'ETIMEDOUT_PRIMARY_MODEL') {
+      throw primaryErr;
+    }
+    const fallbackResp = await withGeminiRetry(
+      () =>
+        ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents,
+          config: buildConfig(ThinkingLevel.MINIMAL),
+        }),
+      1
+    );
+    return (fallbackResp.text ?? '').trim();
+  }
+}
+
 function getResolutionDims(aspectRatio: string, resolution: string): { width: number; height: number } {
   const is1080 = resolution === '1080p';
   if (aspectRatio === '9:16') {
@@ -589,33 +637,30 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
               description: item.originalName,
             };
           }
-          const resp = await withGeminiRetry(() =>
-            ai.models.generateContent({
-              model: 'gemini-4-hydrogen',
-              contents: {
-                parts: [
-                  {
-                    inlineData: {
-                      mimeType: 'image/jpeg',
-                      data: item.thumbnailBase64,
-                    },
+          const text = await generateWithFallback(
+            ai,
+            {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: 'image/jpeg',
+                    data: item.thumbnailBase64,
                   },
-                  {
-                    text: 'Describe brevemente en 1 frase qué muestra esta imagen/escena, su ambiente y qué momento narrativo podría representar.',
-                  },
-                ],
-              },
-              config: {
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              },
-            })
+                },
+                {
+                  text: 'Describe brevemente en 1 frase qué muestra esta imagen/escena, su ambiente y qué momento narrativo podría representar.',
+                },
+              ],
+            },
+            undefined,
+            12000
           );
           return {
             index: item.index,
             originalName: item.originalName,
             mediaType: item.mediaType,
             durationSec: item.durationSec,
-            description: (resp.text || item.originalName).trim(),
+            description: (text || item.originalName).trim(),
           };
         })
       );
@@ -824,41 +869,41 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
     }
   });
 
-  // 1. AI Storyboard & Script Generator (gemini-4-hydrogen)
-  app.post('/api/ai/storyboard', async (req, res) => {
-    try {
-      const {
-        topicOrScript,
-        mode = 'story',
-        targetDurationSec = 60,
-        aspectRatio = '16:9',
-        visualStyle = 'Cinematográfico realista',
-        characters = [],
-        language = 'es-ES',
-      } = req.body ?? {};
+  // 1. AI Storyboard & Script Generator (async job polling + fast fallback)
+  async function runStoryboard(body: {
+    topicOrScript?: string;
+    mode?: string;
+    targetDurationSec?: number;
+    aspectRatio?: string;
+    visualStyle?: string;
+    characters?: Array<{ name: string; role: string; visualDescription: string; voice: string }>;
+    language?: string;
+  }): Promise<unknown> {
+    const {
+      topicOrScript = '',
+      mode = 'story',
+      targetDurationSec = 60,
+      aspectRatio = '16:9',
+      visualStyle = 'Cinematográfico realista',
+      characters = [],
+      language = 'es-ES',
+    } = body ?? {};
 
-      if (!topicOrScript || typeof topicOrScript !== 'string' || !topicOrScript.trim()) {
-        res.status(400).json({ error: 'Escribe una idea o guion para generar el storyboard.' });
-        return;
-      }
+    const ai = getAiClient();
+    const approxScenes = Math.max(3, Math.min(18, Math.round(Number(targetDurationSec) / 10)));
+    const charList = Array.isArray(characters) && characters.length > 0
+      ? characters.map((c) => `- ${c.name} (${c.role}): ${c.visualDescription}. Voz sugerida: ${c.voice}`).join('\n')
+      : 'Sin personajes predefinidos (usa Narrador por defecto).';
 
-      const ai = getAiClient();
-      const approxScenes = Math.max(3, Math.min(18, Math.round(Number(targetDurationSec) / 10)));
-      const charList = Array.isArray(characters) && characters.length > 0
-        ? characters.map((c: { name: string; role: string; visualDescription: string; voice: string }) =>
-            `- ${c.name} (${c.role}): ${c.visualDescription}. Voz sugerida: ${c.voice}`
-          ).join('\n')
-        : 'Sin personajes predefinidos (usa Narrador por defecto).';
+    const modeInstructions: Record<string, string> = {
+      story: 'Narrativa cinematográfica con inicio, desarrollo, clímax y cierre emocional.',
+      documentary: 'Estilo documental informativo con datos claros, ritmo pausado y tomas descriptivas.',
+      commercial: 'Video comercial dinámico enfocado en beneficios, problema/solución y llamado a la acción.',
+      music_video: 'Estructura rítmica y poética pensada para acompañar música de fondo.',
+      image_sequence: 'Secuencia visual contemplativa con descripciones claras para animar imágenes.',
+    };
 
-      const modeInstructions: Record<string, string> = {
-        story: 'Narrativa cinematográfica con inicio, desarrollo, clímax y cierre emocional.',
-        documentary: 'Estilo documental informativo con datos claros, ritmo pausado y tomas descriptivas.',
-        commercial: 'Video comercial dinámico enfocado en beneficios, problema/solución y llamado a la acción.',
-        music_video: 'Estructura rítmica y poética pensada para acompañar música de fondo.',
-        image_sequence: 'Secuencia visual contemplativa con descripciones claras para animar imágenes.',
-      };
-
-      const prompt = `Eres un director de cine y guionista profesional.
+    const prompt = `Eres un director de cine y guionista profesional.
 Crea un storyboard completo para un video en formato ${aspectRatio} (${modeInstructions[mode] || modeInstructions.story}).
 Duración total objetivo aproximada: ${targetDurationSec} segundos (divide en aproximadamente ${approxScenes} escenas de 6 a 15 segundos cada una).
 Estilo visual del proyecto: ${visualStyle}.
@@ -879,54 +924,105 @@ Reglas:
 - Asigna speakerName usando uno de los personajes si encaja, o "Narrador".
 - subtitleText debe ser una versión limpia y concisa de la narración para subtítulos en pantalla.`;
 
-      const response = await withGeminiRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: prompt,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
+    const rawJson = await generateWithFallback(
+      ai,
+      prompt,
+      {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          summary: { type: Type.STRING },
+          scenes: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
                 title: { type: Type.STRING },
-                summary: { type: Type.STRING },
-                scenes: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      visualDirection: { type: Type.STRING },
-                      narration: { type: Type.STRING },
-                      speakerName: { type: Type.STRING },
-                      voiceStyle: { type: Type.STRING },
-                      durationSec: { type: Type.NUMBER },
-                      cameraMotion: { type: Type.STRING },
-                      colorGrade: { type: Type.STRING },
-                      subtitleText: { type: Type.STRING },
-                    },
-                    required: [
-                      'title',
-                      'visualDirection',
-                      'narration',
-                      'speakerName',
-                      'voiceStyle',
-                      'durationSec',
-                      'cameraMotion',
-                      'colorGrade',
-                      'subtitleText',
-                    ],
-                  },
-                },
+                visualDirection: { type: Type.STRING },
+                narration: { type: Type.STRING },
+                speakerName: { type: Type.STRING },
+                voiceStyle: { type: Type.STRING },
+                durationSec: { type: Type.NUMBER },
+                cameraMotion: { type: Type.STRING },
+                colorGrade: { type: Type.STRING },
+                subtitleText: { type: Type.STRING },
               },
-              required: ['title', 'summary', 'scenes'],
+              required: [
+                'title',
+                'visualDirection',
+                'narration',
+                'speakerName',
+                'voiceStyle',
+                'durationSec',
+                'cameraMotion',
+                'colorGrade',
+                'subtitleText',
+              ],
             },
           },
+        },
+        required: ['title', 'summary', 'scenes'],
+      },
+      15000
+    );
+
+    return JSON.parse(rawJson || '{}');
+  }
+
+  app.post('/api/ai/storyboard/start', async (req, res) => {
+    const topicOrScript = req.body?.topicOrScript;
+    if (!topicOrScript || typeof topicOrScript !== 'string' || !topicOrScript.trim()) {
+      res.status(400).json({ error: 'Escribe una idea o guion para generar el storyboard.' });
+      return;
+    }
+
+    const jobId = `sb_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    await savePlanJob(jobId, { status: 'running', createdAt: Date.now() });
+
+    runStoryboard(req.body)
+      .then((plan) => savePlanJob(jobId, { status: 'done', plan, createdAt: Date.now() }))
+      .catch((error) =>
+        savePlanJob(jobId, {
+          status: 'error',
+          error: formatAiError(error, 'Error al generar el storyboard.'),
+          createdAt: Date.now(),
         })
       );
 
-      const parsed = JSON.parse((response.text ?? '{}').trim());
+    res.json({ jobId });
+  });
+
+  app.get('/api/ai/storyboard/:jobId/status', async (req, res) => {
+    const job = await loadPlanJob(req.params.jobId);
+    if (!job) {
+      res.status(404).json({ error: 'Storyboard no encontrado.' });
+      return;
+    }
+    if (job.status === 'done') {
+      const data = job.plan;
+      autoPlanJobs.delete(req.params.jobId);
+      await safeUnlink(path.join(PLAN_JOBS_DIR, `${req.params.jobId}.json`));
+      res.json({ status: 'done', data });
+      return;
+    }
+    if (job.status === 'error') {
+      const error = job.error;
+      autoPlanJobs.delete(req.params.jobId);
+      await safeUnlink(path.join(PLAN_JOBS_DIR, `${req.params.jobId}.json`));
+      res.json({ status: 'error', error });
+      return;
+    }
+    res.json({ status: 'running' });
+  });
+
+  app.post('/api/ai/storyboard', async (req, res) => {
+    try {
+      const topicOrScript = req.body?.topicOrScript;
+      if (!topicOrScript || typeof topicOrScript !== 'string' || !topicOrScript.trim()) {
+        res.status(400).json({ error: 'Escribe una idea o guion para generar el storyboard.' });
+        return;
+      }
+      const parsed = await runStoryboard(req.body);
       res.json(parsed);
     } catch (error) {
       res.status(500).json({ error: formatAiError(error, 'Error al generar el storyboard.') });
@@ -957,49 +1053,46 @@ Instrucción adicional del usuario (opcional): ${instruction || 'Continúa la es
 
 Genera exactamente 2 escenas de continuación que den continuidad narrativa y visual directa a esta escena.`;
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: prompt,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                scenes: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      visualDirection: { type: Type.STRING },
-                      narration: { type: Type.STRING },
-                      speakerName: { type: Type.STRING },
-                      voiceStyle: { type: Type.STRING },
-                      durationSec: { type: Type.NUMBER },
-                      cameraMotion: { type: Type.STRING },
-                      colorGrade: { type: Type.STRING },
-                      subtitleText: { type: Type.STRING },
-                    },
-                    required: [
-                      'title',
-                      'visualDirection',
-                      'narration',
-                      'speakerName',
-                      'voiceStyle',
-                      'durationSec',
-                      'cameraMotion',
-                      'colorGrade',
-                      'subtitleText',
-                    ],
+        const rawJson = await generateWithFallback(
+          ai,
+          prompt,
+          {
+            type: Type.OBJECT,
+            properties: {
+              scenes: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    visualDirection: { type: Type.STRING },
+                    narration: { type: Type.STRING },
+                    speakerName: { type: Type.STRING },
+                    voiceStyle: { type: Type.STRING },
+                    durationSec: { type: Type.NUMBER },
+                    cameraMotion: { type: Type.STRING },
+                    colorGrade: { type: Type.STRING },
+                    subtitleText: { type: Type.STRING },
                   },
+                  required: [
+                    'title',
+                    'visualDirection',
+                    'narration',
+                    'speakerName',
+                    'voiceStyle',
+                    'durationSec',
+                    'cameraMotion',
+                    'colorGrade',
+                    'subtitleText',
+                  ],
                 },
               },
-              required: ['scenes'],
             },
+            required: ['scenes'],
           },
-        });
-        res.json(JSON.parse((response.text ?? '{}').trim()));
+          15000
+        );
+        res.json(JSON.parse(rawJson || '{}'));
         return;
       }
 
@@ -1015,41 +1108,37 @@ Escena actual:
 
 Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el detalle visual.'}"`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              visualDirection: { type: Type.STRING },
-              narration: { type: Type.STRING },
-              voiceStyle: { type: Type.STRING },
-              durationSec: { type: Type.NUMBER },
-              cameraMotion: { type: Type.STRING },
-              colorGrade: { type: Type.STRING },
-              subtitleText: { type: Type.STRING },
-            },
-            required: [
-              'title',
-              'visualDirection',
-              'narration',
-              'voiceStyle',
-              'durationSec',
-              'cameraMotion',
-              'colorGrade',
-              'subtitleText',
-            ],
+      const rawJson = await generateWithFallback(
+        ai,
+        prompt,
+        {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            visualDirection: { type: Type.STRING },
+            narration: { type: Type.STRING },
+            voiceStyle: { type: Type.STRING },
+            durationSec: { type: Type.NUMBER },
+            cameraMotion: { type: Type.STRING },
+            colorGrade: { type: Type.STRING },
+            subtitleText: { type: Type.STRING },
           },
+          required: [
+            'title',
+            'visualDirection',
+            'narration',
+            'voiceStyle',
+            'durationSec',
+            'cameraMotion',
+            'colorGrade',
+            'subtitleText',
+          ],
         },
-      });
-      res.json({ scene: JSON.parse((response.text ?? '{}').trim()) });
+        15000
+      );
+      res.json({ scene: JSON.parse(rawJson || '{}') });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Error al refinar la escena.';
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: formatAiError(error, 'Error al refinar la escena.') });
     }
   });
 
@@ -1212,20 +1301,22 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       const base64AudioData = audioBuffer.toString('base64');
 
       const ai = getAiClient();
-      const interaction = await ai.interactions.create({
-        model: 'gemini-3.5-transcribe',
-        input: [
-          {
-            type: 'audio',
-            data: base64AudioData,
-            mime_type: mimeType,
-          },
-          {
-            type: 'text',
-            text: 'Transcribe con precisión todo el audio hablado. Devuelve únicamente el texto transcrito.',
-          },
-        ],
-      });
+      const interaction = await withGeminiRetry(() =>
+        ai.interactions.create({
+          model: 'gemini-3.5-transcribe',
+          input: [
+            {
+              type: 'audio',
+              data: base64AudioData,
+              mime_type: mimeType,
+            },
+            {
+              type: 'text',
+              text: 'Transcribe con precisión todo el audio hablado. Devuelve únicamente el texto transcrito.',
+            },
+          ],
+        })
+      );
 
       const transcript = (interaction.output_text || '').trim();
       const totalDur = Math.max(2, probed.duration || 10);
@@ -1233,33 +1324,29 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       // Segment transcript cleanly into timed subtitle cues
       let cues: Array<{ startSec: number; endSec: number; text: string }> = [];
       if (transcript) {
-        const segResp = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Divide esta transcripción en bloques cortos de subtítulos (máximo 10 palabras por bloque) distribuidos entre 0 y ${totalDur.toFixed(1)} segundos de forma proporcional.\n\nTranscripción:\n"""\n${transcript}\n"""`,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  startSec: { type: Type.NUMBER },
-                  endSec: { type: Type.NUMBER },
-                  text: { type: Type.STRING },
-                },
-                required: ['startSec', 'endSec', 'text'],
+        const segText = await generateWithFallback(
+          ai,
+          `Divide esta transcripción en bloques cortos de subtítulos (máximo 10 palabras por bloque) distribuidos entre 0 y ${totalDur.toFixed(1)} segundos de forma proporcional.\n\nTranscripción:\n"""\n${transcript}\n"""`,
+          {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                startSec: { type: Type.NUMBER },
+                endSec: { type: Type.NUMBER },
+                text: { type: Type.STRING },
               },
+              required: ['startSec', 'endSec', 'text'],
             },
           },
-        });
-        cues = JSON.parse((segResp.text ?? '[]').trim());
+          12000
+        );
+        cues = JSON.parse(segText || '[]');
       }
 
       res.json({ transcript, durationSec: totalDur, cues });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Error al transcribir el archivo.';
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: formatAiError(error, 'Error al transcribir el archivo.') });
     } finally {
       await safeUnlink(uploadedPath);
       await safeUnlink(tempAudioPath);
