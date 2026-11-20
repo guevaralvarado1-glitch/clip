@@ -55,7 +55,7 @@ function isTransientAiError(err: unknown): boolean {
   );
 }
 
-async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -63,7 +63,7 @@ async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise
     } catch (err) {
       lastErr = err;
       if (attempt < maxRetries && isTransientAiError(err)) {
-        const delayMs = 1200 * Math.pow(2, attempt);
+        const delayMs = 1500 * Math.pow(2, attempt);
         await new Promise((r) => setTimeout(r, delayMs));
         continue;
       }
@@ -103,32 +103,48 @@ async function generateWithFallback(
     return cfg;
   };
 
-  try {
-    const primaryPromise = ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
+  const runWithTimeout = async (model: string, level: ThinkingLevel, ms: number): Promise<string> => {
+    const callPromise = ai.models.generateContent({
+      model,
       contents,
-      config: buildConfig(ThinkingLevel.LOW),
+      config: buildConfig(level),
     });
-    const timeoutPromise = new Promise<never>((_resolve, reject) =>
-      setTimeout(() => reject(new Error('ETIMEDOUT_PRIMARY_MODEL')), timeoutMs)
+    const timerPromise = new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error('ETIMEDOUT_PRIMARY_MODEL')), ms)
     );
-    const resp = await Promise.race([primaryPromise, timeoutPromise]);
+    const resp = await Promise.race([callPromise, timerPromise]);
     return (resp.text ?? '').trim();
+  };
+
+  try {
+    return await runWithTimeout('gemini-4-hydrogen', ThinkingLevel.LOW, timeoutMs);
   } catch (primaryErr) {
     const msg = primaryErr instanceof Error ? primaryErr.message : '';
     if (!isTransientAiError(primaryErr) && msg !== 'ETIMEDOUT_PRIMARY_MODEL') {
       throw primaryErr;
     }
-    const fallbackResp = await withGeminiRetry(
-      () =>
-        ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents,
-          config: buildConfig(ThinkingLevel.MINIMAL),
-        }),
-      1
-    );
-    return (fallbackResp.text ?? '').trim();
+
+    const fallbackPlan: Array<{ model: string; level: ThinkingLevel; delayMs: number; waitMs: number }> = [
+      { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MINIMAL, delayMs: 800, waitMs: 30000 },
+      { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MINIMAL, delayMs: 2500, waitMs: 30000 },
+      { model: 'gemini-4-hydrogen', level: ThinkingLevel.LOW, delayMs: 4000, waitMs: 30000 },
+      { model: 'gemini-3.1-flash-lite', level: ThinkingLevel.MINIMAL, delayMs: 6000, waitMs: 35000 },
+    ];
+
+    let lastErr: unknown = primaryErr;
+    for (const step of fallbackPlan) {
+      await new Promise((r) => setTimeout(r, step.delayMs));
+      try {
+        return await runWithTimeout(step.model, step.level, step.waitMs);
+      } catch (err) {
+        lastErr = err;
+        const errMsg = err instanceof Error ? err.message : '';
+        if (!isTransientAiError(err) && errMsg !== 'ETIMEDOUT_PRIMARY_MODEL') {
+          throw err;
+        }
+      }
+    }
+    throw lastErr;
   }
 }
 
@@ -429,41 +445,8 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
       ],
     };
 
-    try {
-      const primaryPromise = ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema,
-        },
-      });
-      const timeoutPromise = new Promise<never>((_resolve, reject) =>
-        setTimeout(() => reject(new Error('ETIMEDOUT_PRIMARY_MODEL')), 15000)
-      );
-      const response = await Promise.race([primaryPromise, timeoutPromise]);
-      return JSON.parse((response.text ?? '{}').trim());
-    } catch (primaryErr) {
-      const msg = primaryErr instanceof Error ? primaryErr.message : '';
-      if (!isTransientAiError(primaryErr) && msg !== 'ETIMEDOUT_PRIMARY_MODEL') {
-        throw primaryErr;
-      }
-      const fallbackResp = await withGeminiRetry(
-        () =>
-          ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite',
-            contents: prompt,
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-              responseMimeType: 'application/json',
-              responseSchema,
-            },
-          }),
-        1
-      );
-      return JSON.parse((fallbackResp.text ?? '{}').trim());
-    }
+    const rawPlan = await generateWithFallback(ai, prompt, responseSchema, 15000);
+    return JSON.parse(rawPlan || '{}');
   }
 
   app.post('/api/ai/auto-plan/start', async (req, res) => {
