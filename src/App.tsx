@@ -4,10 +4,10 @@ import { Project } from './types/studio';
 import {
   createDefaultProject,
   deleteProject,
-  getMediaBlob,
   listProjects,
   saveProject,
 } from './lib/storage';
+import { exportProjectMp4 } from './lib/exportClient';
 import { StudioWorkspace } from './components/StudioWorkspace';
 import { AutoPilotView } from './components/AutoPilotView';
 import { CharactersView } from './components/CharactersView';
@@ -22,6 +22,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<ActiveView>('autopilot');
   const [booting, setBooting] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -79,78 +80,13 @@ export default function App() {
     try {
       setExportError(null);
       setExporting(true);
-
-      const fd = new FormData();
-      const manifest = {
-        title: activeProject.title,
-        aspectRatio: activeProject.aspectRatio,
-        resolution: activeProject.resolution,
-        transitionType: activeProject.transitionType,
-        transitionDurationSec: activeProject.transitionDurationSec,
-        musicVolume: activeProject.musicVolume,
-        voiceVolume: activeProject.voiceVolume,
-        clipAudioVolume: activeProject.clipAudioVolume,
-        burnSubtitles: activeProject.burnSubtitles,
-        subtitles: activeProject.subtitles,
-        scenes: activeProject.scenes.map((sc) => ({
-          id: sc.id,
-          title: sc.title,
-          durationSec: sc.durationSec,
-          cameraMotion: sc.cameraMotion,
-          colorGrade: sc.colorGrade,
-          subtitleText: sc.subtitleText,
-          narration: sc.narration,
-          overlayCaption: sc.overlayCaption,
-          originalVideoMuted: sc.originalVideoMuted,
-        })),
-      };
-      fd.append('manifest', JSON.stringify(manifest));
-
-      for (const sc of activeProject.scenes) {
-        if (sc.videoClipBlobId) {
-          const clipBlob = await getMediaBlob(sc.videoClipBlobId);
-          if (clipBlob) fd.append(`clip_${sc.id}`, clipBlob, `clip_${sc.id}.mp4`);
-        } else if (sc.imageBlobId) {
-          const imgBlob = await getMediaBlob(sc.imageBlobId);
-          if (imgBlob) fd.append(`image_${sc.id}`, imgBlob, `image_${sc.id}.png`);
-        }
-        if (sc.audioBlobId) {
-          const audBlob = await getMediaBlob(sc.audioBlobId);
-          if (audBlob) fd.append(`audio_${sc.id}`, audBlob, `audio_${sc.id}.wav`);
-        }
-      }
-
-      if (activeProject.musicBlobId) {
-        const musicBlob = await getMediaBlob(activeProject.musicBlobId);
-        if (musicBlob) fd.append('music_track', musicBlob, activeProject.musicFileName || 'music.mp3');
-      }
-
-      const res = await fetch('/api/export/mp4', {
-        method: 'POST',
-        body: fd,
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Error al ensamblar el video MP4.');
-      }
-
-      const mp4Blob = await res.blob();
-      const url = URL.createObjectURL(mp4Blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const slug =
-        activeProject.title
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-|-$/g, '') || 'cinecraft-video';
-      a.download = `${slug}.mp4`;
-      a.click();
-      URL.revokeObjectURL(url);
+      setExportProgress('Iniciando...');
+      await exportProjectMp4(activeProject, (msg) => setExportProgress(msg));
     } catch (err) {
       setExportError(err instanceof Error ? err.message : 'Error al exportar MP4.');
     } finally {
       setExporting(false);
+      setExportProgress(null);
     }
   };
 
@@ -211,8 +147,8 @@ export default function App() {
           >
             {exporting ? (
               <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Renderizando MP4...
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                <span className="max-w-[190px] truncate">{exportProgress || 'Renderizando MP4...'}</span>
               </>
             ) : (
               <>

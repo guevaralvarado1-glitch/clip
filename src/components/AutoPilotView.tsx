@@ -21,8 +21,13 @@ import {
   TransitionType,
   VoiceName,
 } from '../types/studio';
-import { getMediaBlob, saveMediaBlob, uid } from '../lib/storage';
+import { saveMediaBlob, uid } from '../lib/storage';
 import { generateEditorialSlateImage, SlatePalette } from '../lib/canvasCards';
+import {
+  exportProjectMp4,
+  extractMediaPreviewThumbnail,
+  safeJson,
+} from '../lib/exportClient';
 import { ScriptGeneratorView } from './ScriptGeneratorView';
 
 interface AutoPilotViewProps {
@@ -121,16 +126,32 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
       const userBlobIds: string[] = [];
 
       if (userFiles.length > 0) {
-        updateStep('analyze', { status: 'running', detail: 'Guardando y analizando archivos...' });
-        for (const f of userFiles) {
+        updateStep('analyze', { status: 'running', detail: 'Extrayendo miniaturas y analizando archivos...' });
+        const thumbItems: Array<{
+          index: number;
+          originalName: string;
+          mediaType: 'image' | 'video';
+          durationSec: number;
+          thumbnailBase64: string;
+        }> = [];
+        for (let i = 0; i < userFiles.length; i++) {
+          const f = userFiles[i];
           userBlobIds.push(await saveMediaBlob(f));
+          const preview = await extractMediaPreviewThumbnail(f);
+          thumbItems.push({
+            index: i,
+            originalName: f.name,
+            mediaType: preview.mediaType,
+            durationSec: preview.durationSec,
+            thumbnailBase64: preview.thumbnailBase64,
+          });
         }
-        const fd = new FormData();
-        for (const f of userFiles) {
-          fd.append('files', f);
-        }
-        const analyzeRes = await fetch('/api/ai/analyze-media', { method: 'POST', body: fd });
-        const analyzeData = await analyzeRes.json();
+        const analyzeRes = await fetch('/api/ai/analyze-thumbnails', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: thumbItems }),
+        });
+        const analyzeData = await safeJson(analyzeRes);
         if (!analyzeRes.ok) throw new Error(analyzeData.error || 'Error analizando archivos.');
         analyzedUserMedia = analyzeData.items || [];
         updateStep('analyze', {
@@ -139,9 +160,9 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
         });
       }
 
-      // 2. Autonomous Plan
+      // 2. Autonomous Plan (async job polling so proxy timeout never occurs)
       updateStep('plan', { status: 'running', detail: 'Diseñando estructura narrativa...' });
-      const planRes = await fetch('/api/ai/auto-plan', {
+      const planStartRes = await fetch('/api/ai/auto-plan/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -150,8 +171,40 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
           userMedia: analyzedUserMedia,
         }),
       });
-      const plan = await planRes.json();
-      if (!planRes.ok) throw new Error(plan.error || 'Error al planificar el video.');
+      const planStartData = await safeJson<{ jobId?: string; error?: string }>(planStartRes);
+      if (!planStartRes.ok || !planStartData.jobId) {
+        throw new Error(planStartData.error || 'Error al iniciar la planificación.');
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let plan: any = null;
+      const planStartTime = Date.now();
+      for (let attempt = 0; attempt < 120; attempt++) {
+        await new Promise((r) => window.setTimeout(r, 1500));
+        const elapsed = Math.round((Date.now() - planStartTime) / 1000);
+        updateStep('plan', { detail: `Diseñando estructura narrativa... (${elapsed}s)` });
+
+        const statusRes = await fetch(`/api/ai/auto-plan/${planStartData.jobId}/status`);
+        const statusData = await safeJson<{
+          status?: 'running' | 'done' | 'error';
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          plan?: any;
+          error?: string;
+        }>(statusRes);
+        if (!statusRes.ok) {
+          throw new Error(statusData.error || 'Error consultando la planificación.');
+        }
+        if (statusData.status === 'error') {
+          throw new Error(statusData.error || 'Error al planificar el video.');
+        }
+        if (statusData.status === 'done' && statusData.plan) {
+          plan = statusData.plan;
+          break;
+        }
+      }
+      if (!plan) {
+        throw new Error('La planificación tardó demasiado en completarse.');
+      }
 
       const validVoices: VoiceName[] = ['Charon', 'Kore', 'Puck', 'Fenrir', 'Zephyr'];
       const validModes: CreationMode[] = ['story', 'documentary', 'commercial', 'music_video', 'image_sequence'];
@@ -302,7 +355,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
             language,
           }),
         });
-        const ttsData = await ttsRes.json();
+        const ttsData = await safeJson(ttsRes);
         if (!ttsRes.ok) throw new Error(ttsData.error || `Error generando voz en escena ${i + 1}`);
 
         const wavBlob = base64ToBlob(ttsData.audioBase64, ttsData.mimeType || 'audio/wav');
@@ -386,76 +439,16 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
         detail: `${subtitles.length} subtítulos${musicBlobId ? ' + música ambiental' : ''}`,
       });
 
-      // 6. Auto-export single MP4 if checked
+      // 6. Auto-export single MP4 if checked (chunked upload + async render polling)
       if (autoDownloadMp4) {
         updateStep('export', {
           status: 'running',
-          detail: 'Renderizando y mezclando MP4 en el servidor...',
+          detail: 'Preparando exportación MP4...',
         });
 
-        const fd = new FormData();
-        fd.append(
-          'manifest',
-          JSON.stringify({
-            title: newProject.title,
-            aspectRatio: newProject.aspectRatio,
-            resolution: newProject.resolution,
-            transitionType: newProject.transitionType,
-            transitionDurationSec: newProject.transitionDurationSec,
-            musicVolume: newProject.musicVolume,
-            voiceVolume: newProject.voiceVolume,
-            clipAudioVolume: newProject.clipAudioVolume,
-            burnSubtitles: newProject.burnSubtitles,
-            subtitles: newProject.subtitles,
-            scenes: newProject.scenes.map((sc) => ({
-              id: sc.id,
-              title: sc.title,
-              durationSec: sc.durationSec,
-              cameraMotion: sc.cameraMotion,
-              colorGrade: sc.colorGrade,
-              subtitleText: sc.subtitleText,
-              narration: sc.narration,
-              overlayCaption: sc.overlayCaption,
-            })),
-          })
-        );
-
-        for (const sc of newProject.scenes) {
-          if (sc.videoClipBlobId) {
-            const b = await getMediaBlob(sc.videoClipBlobId);
-            if (b) fd.append(`clip_${sc.id}`, b, `clip_${sc.id}.mp4`);
-          } else if (sc.imageBlobId) {
-            const b = await getMediaBlob(sc.imageBlobId);
-            if (b) fd.append(`image_${sc.id}`, b, `image_${sc.id}.png`);
-          }
-          if (sc.audioBlobId) {
-            const b = await getMediaBlob(sc.audioBlobId);
-            if (b) fd.append(`audio_${sc.id}`, b, `audio_${sc.id}.wav`);
-          }
-        }
-        if (newProject.musicBlobId) {
-          const mb = await getMediaBlob(newProject.musicBlobId);
-          if (mb) fd.append('music_track', mb, newProject.musicFileName || 'music.mp3');
-        }
-
-        const expRes = await fetch('/api/export/mp4', { method: 'POST', body: fd });
-        if (!expRes.ok) {
-          const errData = await expRes.json().catch(() => ({}));
-          throw new Error(errData.error || 'Error exportando el MP4 final.');
-        }
-
-        const mp4Blob = await expRes.blob();
-        const url = URL.createObjectURL(mp4Blob);
-        const a = document.createElement('a');
-        a.href = url;
-        const slug =
-          newProject.title
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/^-|-$/g, '') || 'video-autopiloto';
-        a.download = `${slug}.mp4`;
-        a.click();
-        URL.revokeObjectURL(url);
+        await exportProjectMp4(newProject, (msg) => {
+          updateStep('export', { detail: msg });
+        });
 
         updateStep('export', { status: 'done', detail: 'MP4 descargado' });
       }
@@ -532,6 +525,42 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
         <div className="px-4 py-3 rounded-lg bg-red-950/40 border border-red-500/30 text-sm text-red-200">
           {error}
         </div>
+      )}
+
+      {/* Live Pipeline Progress */}
+      {steps.length > 0 && (
+        <section className="p-5 rounded-xl bg-[#13161D] border border-white/[0.08] space-y-3">
+          <h3 className="text-xs font-semibold text-[#F1F3F6]">Progreso de producción</h3>
+          <div className="space-y-2.5">
+            {steps.map((step) => (
+              <div key={step.id} className="flex items-center justify-between gap-4 text-xs">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  {step.status === 'done' && (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  )}
+                  {step.status === 'running' && (
+                    <Loader2 className="w-4 h-4 text-[#E5A93B] animate-spin shrink-0" />
+                  )}
+                  {(step.status === 'pending' || step.status === 'skipped') && (
+                    <Circle className="w-4 h-4 text-[#4B5563] shrink-0" />
+                  )}
+                  <span
+                    className={
+                      step.status === 'skipped'
+                        ? 'text-[#6B7280]'
+                        : step.status === 'running'
+                        ? 'text-[#F1F3F6] font-medium'
+                        : 'text-[#C8CDD8]'
+                    }
+                  >
+                    {step.label}
+                  </span>
+                </div>
+                <span className="text-[11px] text-[#8C94A4] truncate">{step.detail}</span>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
 
       <form onSubmit={handleRunAutoPilot} className="space-y-6">
@@ -700,42 +729,6 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
           </button>
         </div>
       </form>
-
-      {/* Live Pipeline Progress */}
-      {steps.length > 0 && (
-        <section className="p-5 rounded-xl bg-[#13161D] border border-white/[0.08] space-y-3">
-          <h3 className="text-xs font-semibold text-[#F1F3F6]">Progreso de producción</h3>
-          <div className="space-y-2.5">
-            {steps.map((step) => (
-              <div key={step.id} className="flex items-center justify-between gap-4 text-xs">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  {step.status === 'done' && (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                  )}
-                  {step.status === 'running' && (
-                    <Loader2 className="w-4 h-4 text-[#E5A93B] animate-spin shrink-0" />
-                  )}
-                  {(step.status === 'pending' || step.status === 'skipped') && (
-                    <Circle className="w-4 h-4 text-[#4B5563] shrink-0" />
-                  )}
-                  <span
-                    className={
-                      step.status === 'skipped'
-                        ? 'text-[#6B7280]'
-                        : step.status === 'running'
-                        ? 'text-[#F1F3F6] font-medium'
-                        : 'text-[#C8CDD8]'
-                    }
-                  >
-                    {step.label}
-                  </span>
-                </div>
-                <span className="text-[11px] text-[#8C94A4] truncate">{step.detail}</span>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
     </div>
   );
 };

@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Project, SubtitleCue, TransitionType } from '../types/studio';
 import { saveMediaBlob, uid } from '../lib/storage';
+import { safeJson } from '../lib/exportClient';
 import { formatTimecode, useBlobUrl } from '../hooks/useBlobUrl';
 
 interface AudioSubtitlesViewProps {
@@ -97,7 +98,7 @@ export const AudioSubtitlesView: React.FC<AudioSubtitlesViewProps> = ({
             dialogueLines: scene.dialogueLines,
           }),
         });
-        const data = await res.json();
+        const data = await safeJson(res);
         if (!res.ok) {
           throw new Error(data.error || `Error en escena "${scene.title}"`);
         }
@@ -161,7 +162,7 @@ export const AudioSubtitlesView: React.FC<AudioSubtitlesViewProps> = ({
         method: 'POST',
         body: fd,
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'Error al transcribir archivo.');
 
       const newCues: SubtitleCue[] = (data.cues || []).map(

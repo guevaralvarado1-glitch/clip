@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Plus, Trash2, Upload, User, Volume2 } from 'lucide-react';
 import { Character, Project, VoiceName } from '../types/studio';
 import { saveMediaBlob, uid } from '../lib/storage';
+import { safeJson } from '../lib/exportClient';
 import { useBlobUrl } from '../hooks/useBlobUrl';
 
 interface CharactersViewProps {
@@ -48,7 +49,7 @@ const CharacterCard: React.FC<{
           language,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'No se pudo probar la voz.');
       const audio = new Audio(`data:${data.mimeType};base64,${data.audioBase64}`);
       await audio.play();

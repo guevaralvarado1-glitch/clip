@@ -10,6 +10,7 @@ import {
   Scene,
 } from '../types/studio';
 import { saveMediaBlob, uid } from '../lib/storage';
+import { safeJson } from '../lib/exportClient';
 
 interface ScriptGeneratorViewProps {
   project: Project;
@@ -73,7 +74,7 @@ export const ScriptGeneratorView: React.FC<ScriptGeneratorViewProps> = ({
           language,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) {
         throw new Error(data.error || 'Error al generar el storyboard.');
       }

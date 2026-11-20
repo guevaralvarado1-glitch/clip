@@ -7,7 +7,7 @@ import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 dotenv.config();
 
@@ -36,6 +36,47 @@ function getAiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function isTransientAiError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return (
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('high demand') ||
+    msg.includes('429') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT')
+  );
+}
+
+async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries && isTransientAiError(err)) {
+        const delayMs = 1200 * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+function formatAiError(error: unknown, fallback: string): string {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+    return 'El servicio de IA está saturado temporalmente (503). Intenta nuevamente en unos segundos.';
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+    return 'Se alcanzó el límite temporal de solicitudes gratuitas de IA (429). Espera un momento e inténtalo de nuevo.';
+  }
+  return raw || fallback;
 }
 
 function getResolutionDims(aspectRatio: string, resolution: string): { width: number; height: number } {
@@ -184,29 +225,34 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
-  // 0A. Autonomous Director Planner (decides format, duration, style, cast, scenes & search queries from 1 idea)
-  app.post('/api/ai/auto-plan', async (req, res) => {
-    try {
-      const { idea, language = 'es-ES', userMedia = [] } = req.body ?? {};
-      if (!idea || typeof idea !== 'string' || !idea.trim()) {
-        res.status(400).json({ error: 'Escribe una idea para iniciar el Piloto Automático.' });
-        return;
-      }
+  // 0A. Autonomous Director Planner (async job + sync compatibility, with fast fallback)
+  interface AutoPlanJob {
+    status: 'running' | 'done' | 'error';
+    plan?: unknown;
+    error?: string;
+    createdAt: number;
+  }
+  const autoPlanJobs = new Map<string, AutoPlanJob>();
 
-      const ai = getAiClient();
-      const langName = language.startsWith('en') ? 'Inglés' : language.startsWith('pt') ? 'Portugués' : 'Español';
-      const mediaContext =
-        Array.isArray(userMedia) && userMedia.length > 0
-          ? `El usuario subió ${userMedia.length} archivos propios (úsalos donde mejor encajen asignando matchedMediaIndex de 0 a ${userMedia.length - 1}, o -1 si la escena debe buscar un visual automático):\n` +
-            userMedia
-              .map(
-                (m: { index: number; mediaType: string; description: string; durationSec?: number }) =>
-                  `- Archivo [${m.index}] (${m.mediaType}${m.durationSec ? `, ${Math.round(m.durationSec)}s` : ''}): ${m.description}`
-              )
-              .join('\n')
-          : 'El usuario no subió archivos propios; todas las escenas deben usar matchedMediaIndex = -1 y un searchQuery excelente.';
+  async function runAutoPlan(
+    idea: string,
+    language = 'es-ES',
+    userMedia: Array<{ index: number; mediaType: string; description: string; durationSec?: number }> = []
+  ): Promise<unknown> {
+    const ai = getAiClient();
+    const langName = language.startsWith('en') ? 'Inglés' : language.startsWith('pt') ? 'Portugués' : 'Español';
+    const mediaContext =
+      Array.isArray(userMedia) && userMedia.length > 0
+        ? `El usuario subió ${userMedia.length} archivos propios (úsalos donde mejor encajen asignando matchedMediaIndex de 0 a ${userMedia.length - 1}, o -1 si la escena debe buscar un visual automático):\n` +
+          userMedia
+            .map(
+              (m) =>
+                `- Archivo [${m.index}] (${m.mediaType}${m.durationSec ? `, ${Math.round(m.durationSec)}s` : ''}): ${m.description}`
+            )
+            .join('\n')
+        : 'El usuario no subió archivos propios; todas las escenas deben usar matchedMediaIndex = -1 y un searchQuery excelente.';
 
-      const prompt = `Eres un director de cine y productor ejecutivo autónomo.
+    const prompt = `Eres un director de cine y productor ejecutivo autónomo.
 El usuario te da únicamente esta idea:
 """
 ${idea.trim()}
@@ -228,91 +274,178 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
    - "narration": texto natural con ~2.2 palabras por segundo para caber en durationSec.
    - "matchedMediaIndex": índice entero del archivo subido por el usuario que mejor encaja, o -1 si no aplica.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        title: { type: Type.STRING },
+        description: { type: Type.STRING },
+        mode: { type: Type.STRING },
+        aspectRatio: { type: Type.STRING },
+        visualStyle: { type: Type.STRING },
+        transitionType: { type: Type.STRING },
+        musicMood: { type: Type.STRING },
+        characters: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              role: { type: Type.STRING },
+              visualDescription: { type: Type.STRING },
+              voice: { type: Type.STRING },
+              voiceStyle: { type: Type.STRING },
+            },
+            required: ['name', 'role', 'visualDescription', 'voice', 'voiceStyle'],
+          },
+        },
+        scenes: {
+          type: Type.ARRAY,
+          items: {
             type: Type.OBJECT,
             properties: {
               title: { type: Type.STRING },
-              description: { type: Type.STRING },
-              mode: { type: Type.STRING },
-              aspectRatio: { type: Type.STRING },
-              visualStyle: { type: Type.STRING },
-              transitionType: { type: Type.STRING },
-              musicMood: { type: Type.STRING },
-              characters: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    name: { type: Type.STRING },
-                    role: { type: Type.STRING },
-                    visualDescription: { type: Type.STRING },
-                    voice: { type: Type.STRING },
-                    voiceStyle: { type: Type.STRING },
-                  },
-                  required: ['name', 'role', 'visualDescription', 'voice', 'voiceStyle'],
-                },
-              },
-              scenes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    visualDirection: { type: Type.STRING },
-                    searchQuery: { type: Type.STRING },
-                    narration: { type: Type.STRING },
-                    speakerName: { type: Type.STRING },
-                    voice: { type: Type.STRING },
-                    voiceStyle: { type: Type.STRING },
-                    durationSec: { type: Type.NUMBER },
-                    cameraMotion: { type: Type.STRING },
-                    colorGrade: { type: Type.STRING },
-                    subtitleText: { type: Type.STRING },
-                    overlayCaption: { type: Type.STRING },
-                    matchedMediaIndex: { type: Type.INTEGER },
-                  },
-                  required: [
-                    'title',
-                    'visualDirection',
-                    'searchQuery',
-                    'narration',
-                    'speakerName',
-                    'voice',
-                    'voiceStyle',
-                    'durationSec',
-                    'cameraMotion',
-                    'colorGrade',
-                    'subtitleText',
-                    'overlayCaption',
-                    'matchedMediaIndex',
-                  ],
-                },
-              },
+              visualDirection: { type: Type.STRING },
+              searchQuery: { type: Type.STRING },
+              narration: { type: Type.STRING },
+              speakerName: { type: Type.STRING },
+              voice: { type: Type.STRING },
+              voiceStyle: { type: Type.STRING },
+              durationSec: { type: Type.NUMBER },
+              cameraMotion: { type: Type.STRING },
+              colorGrade: { type: Type.STRING },
+              subtitleText: { type: Type.STRING },
+              overlayCaption: { type: Type.STRING },
+              matchedMediaIndex: { type: Type.INTEGER },
             },
             required: [
               'title',
-              'description',
-              'mode',
-              'aspectRatio',
-              'visualStyle',
-              'transitionType',
-              'musicMood',
-              'characters',
-              'scenes',
+              'visualDirection',
+              'searchQuery',
+              'narration',
+              'speakerName',
+              'voice',
+              'voiceStyle',
+              'durationSec',
+              'cameraMotion',
+              'colorGrade',
+              'subtitleText',
+              'overlayCaption',
+              'matchedMediaIndex',
             ],
           },
         },
+      },
+      required: [
+        'title',
+        'description',
+        'mode',
+        'aspectRatio',
+        'visualStyle',
+        'transitionType',
+        'musicMood',
+        'characters',
+        'scenes',
+      ],
+    };
+
+    try {
+      const primaryPromise = ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema,
+        },
+      });
+      const timeoutPromise = new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error('ETIMEDOUT_PRIMARY_MODEL')), 15000)
+      );
+      const response = await Promise.race([primaryPromise, timeoutPromise]);
+      return JSON.parse((response.text ?? '{}').trim());
+    } catch (primaryErr) {
+      const msg = primaryErr instanceof Error ? primaryErr.message : '';
+      if (!isTransientAiError(primaryErr) && msg !== 'ETIMEDOUT_PRIMARY_MODEL') {
+        throw primaryErr;
+      }
+      const fallbackResp = await withGeminiRetry(
+        () =>
+          ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite',
+            contents: prompt,
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+              responseMimeType: 'application/json',
+              responseSchema,
+            },
+          }),
+        1
+      );
+      return JSON.parse((fallbackResp.text ?? '{}').trim());
+    }
+  }
+
+  app.post('/api/ai/auto-plan/start', (req, res) => {
+    const { idea, language = 'es-ES', userMedia = [] } = req.body ?? {};
+    if (!idea || typeof idea !== 'string' || !idea.trim()) {
+      res.status(400).json({ error: 'Escribe una idea para iniciar el Piloto Automático.' });
+      return;
+    }
+
+    const jobId = `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    autoPlanJobs.set(jobId, { status: 'running', createdAt: Date.now() });
+
+    runAutoPlan(idea, language, userMedia)
+      .then((plan) => {
+        const job = autoPlanJobs.get(jobId);
+        if (job) {
+          job.status = 'done';
+          job.plan = plan;
+        }
+      })
+      .catch((error) => {
+        const job = autoPlanJobs.get(jobId);
+        if (job) {
+          job.status = 'error';
+          job.error = formatAiError(error, 'Error en la planificación autónoma.');
+        }
       });
 
-      res.json(JSON.parse((response.text ?? '{}').trim()));
+    res.json({ jobId });
+  });
+
+  app.get('/api/ai/auto-plan/:jobId/status', (req, res) => {
+    const job = autoPlanJobs.get(req.params.jobId);
+    if (!job) {
+      res.status(404).json({ error: 'Planificación no encontrada.' });
+      return;
+    }
+    if (job.status === 'done') {
+      const plan = job.plan;
+      autoPlanJobs.delete(req.params.jobId);
+      res.json({ status: 'done', plan });
+      return;
+    }
+    if (job.status === 'error') {
+      const error = job.error;
+      autoPlanJobs.delete(req.params.jobId);
+      res.json({ status: 'error', error });
+      return;
+    }
+    res.json({ status: 'running' });
+  });
+
+  app.post('/api/ai/auto-plan', async (req, res) => {
+    try {
+      const { idea, language = 'es-ES', userMedia = [] } = req.body ?? {};
+      if (!idea || typeof idea !== 'string' || !idea.trim()) {
+        res.status(400).json({ error: 'Escribe una idea para iniciar el Piloto Automático.' });
+        return;
+      }
+      const plan = await runAutoPlan(idea, language, userMedia);
+      res.json(plan);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Error en la planificación autónoma.';
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: formatAiError(error, 'Error en la planificación autónoma.') });
     }
   });
 
@@ -380,6 +513,9 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
               },
             ],
           },
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
         });
 
         results.push({
@@ -398,6 +534,71 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
     } finally {
       for (const f of files) await safeUnlink(f.path);
       for (const t of tempThumbs) await safeUnlink(t);
+    }
+  });
+
+  // 0B-bis. Fast Thumbnail Analyzer (accepts lightweight browser-extracted JPEG previews < 100KB)
+  app.post('/api/ai/analyze-thumbnails', async (req, res) => {
+    try {
+      const items: Array<{
+        index: number;
+        originalName: string;
+        mediaType: 'image' | 'video';
+        durationSec: number;
+        thumbnailBase64: string;
+      }> = Array.isArray(req.body?.items) ? req.body.items : [];
+
+      if (items.length === 0) {
+        res.json({ items: [] });
+        return;
+      }
+
+      const ai = getAiClient();
+      const analyzed = await Promise.all(
+        items.map(async (item) => {
+          if (!item.thumbnailBase64) {
+            return {
+              index: item.index,
+              originalName: item.originalName,
+              mediaType: item.mediaType,
+              durationSec: item.durationSec,
+              description: item.originalName,
+            };
+          }
+          const resp = await withGeminiRetry(() =>
+            ai.models.generateContent({
+              model: 'gemini-4-hydrogen',
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'image/jpeg',
+                      data: item.thumbnailBase64,
+                    },
+                  },
+                  {
+                    text: 'Describe brevemente en 1 frase qué muestra esta imagen/escena, su ambiente y qué momento narrativo podría representar.',
+                  },
+                ],
+              },
+              config: {
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            })
+          );
+          return {
+            index: item.index,
+            originalName: item.originalName,
+            mediaType: item.mediaType,
+            durationSec: item.durationSec,
+            description: (resp.text || item.originalName).trim(),
+          };
+        })
+      );
+
+      res.json({ items: analyzed });
+    } catch (error) {
+      res.status(500).json({ error: formatAiError(error, 'Error al analizar las miniaturas.') });
     }
   });
 
@@ -654,55 +855,57 @@ Reglas:
 - Asigna speakerName usando uno de los personajes si encaja, o "Narrador".
 - subtitleText debe ser una versión limpia y concisa de la narración para subtítulos en pantalla.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              summary: { type: Type.STRING },
-              scenes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    visualDirection: { type: Type.STRING },
-                    narration: { type: Type.STRING },
-                    speakerName: { type: Type.STRING },
-                    voiceStyle: { type: Type.STRING },
-                    durationSec: { type: Type.NUMBER },
-                    cameraMotion: { type: Type.STRING },
-                    colorGrade: { type: Type.STRING },
-                    subtitleText: { type: Type.STRING },
+      const response = await withGeminiRetry(() =>
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                summary: { type: Type.STRING },
+                scenes: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING },
+                      visualDirection: { type: Type.STRING },
+                      narration: { type: Type.STRING },
+                      speakerName: { type: Type.STRING },
+                      voiceStyle: { type: Type.STRING },
+                      durationSec: { type: Type.NUMBER },
+                      cameraMotion: { type: Type.STRING },
+                      colorGrade: { type: Type.STRING },
+                      subtitleText: { type: Type.STRING },
+                    },
+                    required: [
+                      'title',
+                      'visualDirection',
+                      'narration',
+                      'speakerName',
+                      'voiceStyle',
+                      'durationSec',
+                      'cameraMotion',
+                      'colorGrade',
+                      'subtitleText',
+                    ],
                   },
-                  required: [
-                    'title',
-                    'visualDirection',
-                    'narration',
-                    'speakerName',
-                    'voiceStyle',
-                    'durationSec',
-                    'cameraMotion',
-                    'colorGrade',
-                    'subtitleText',
-                  ],
                 },
               },
+              required: ['title', 'summary', 'scenes'],
             },
-            required: ['title', 'summary', 'scenes'],
           },
-        },
-      });
+        })
+      );
 
       const parsed = JSON.parse((response.text ?? '{}').trim());
       res.json(parsed);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Error al generar el storyboard.';
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: formatAiError(error, 'Error al generar el storyboard.') });
     }
   });
 
@@ -734,6 +937,7 @@ Genera exactamente 2 escenas de continuación que den continuidad narrativa y vi
           model: 'gemini-4-hydrogen',
           contents: prompt,
           config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -791,6 +995,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         model: 'gemini-4-hydrogen',
         contents: prompt,
         config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -869,16 +1074,18 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           return;
         }
 
-        const interaction = await ai.interactions.create({
-          model: 'gemini-3.8-flash-tts',
-          input: inputBlocks,
-          response_format: { type: 'audio' },
-          generation_config: {
-            speech_config: {
-              speakers,
+        const interaction = await withGeminiRetry(() =>
+          ai.interactions.create({
+            model: 'gemini-3.8-flash-tts',
+            input: inputBlocks,
+            response_format: { type: 'audio' },
+            generation_config: {
+              speech_config: {
+                speakers,
+              },
             },
-          },
-        });
+          })
+        );
 
         const audio = interaction.output_audio;
         if (!audio?.data) {
@@ -898,30 +1105,32 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         return;
       }
 
-      const interaction = await ai.interactions.create({
-        model: 'gemini-3.8-flash-lite-tts',
-        input: [
-          {
-            type: 'text',
-            text: text.trim(),
-            annotations: [
+      const interaction = await withGeminiRetry(() =>
+        ai.interactions.create({
+          model: 'gemini-3.8-flash-lite-tts',
+          input: [
+            {
+              type: 'text',
+              text: text.trim(),
+              annotations: [
+                {
+                  type: 'speech_metadata',
+                  style: voiceStyle,
+                },
+              ],
+            },
+          ],
+          response_format: { type: 'audio' },
+          generation_config: {
+            speech_config: [
               {
-                type: 'speech_metadata',
-                style: voiceStyle,
+                language,
+                voice,
               },
             ],
           },
-        ],
-        response_format: { type: 'audio' },
-        generation_config: {
-          speech_config: [
-            {
-              language,
-              voice,
-            },
-          ],
-        },
-      });
+        })
+      );
 
       const audio = interaction.output_audio;
       if (!audio?.data) {
@@ -934,8 +1143,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         durationSec: estimateWavDuration(wavBuf),
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Error al generar voz con IA.';
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: formatAiError(error, 'Error al generar voz con IA.') });
     }
   });
 
@@ -1005,6 +1213,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           model: 'gemini-4-hydrogen',
           contents: `Divide esta transcripción en bloques cortos de subtítulos (máximo 10 palabras por bloque) distribuidos entre 0 y ${totalDur.toFixed(1)} segundos de forma proporcional.\n\nTranscripción:\n"""\n${transcript}\n"""`,
           config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.ARRAY,
@@ -1231,145 +1440,117 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
     }
   });
 
-  // 7. Full Long-Video Multi-Scene + Voice + Music + Subtitles MP4 Exporter
-  app.post('/api/export/mp4', upload.any(), async (req, res) => {
-    const uploadedFiles = (req.files as Express.Multer.File[]) || [];
-    const workDir = await fsp.mkdtemp(path.join(TEMP_ROOT, 'export-'));
+  // Helper shared by synchronous /api/export/mp4 and async chunked export jobs
+  interface ExportSceneInput {
+    id: string;
+    title: string;
+    durationSec: number;
+    cameraMotion: string;
+    colorGrade: string;
+    subtitleText?: string;
+    narration?: string;
+    overlayCaption?: string;
+    originalVideoMuted?: boolean;
+  }
 
-    try {
-      const manifestRaw = req.body?.manifest;
-      if (!manifestRaw) {
-        res.status(400).json({ error: 'Manifiesto de exportación requerido.' });
-        return;
-      }
-      const manifest = JSON.parse(manifestRaw);
-      const scenes: Array<{
-        id: string;
-        title: string;
-        durationSec: number;
-        cameraMotion: string;
-        colorGrade: string;
-        subtitleText?: string;
-        narration?: string;
-        overlayCaption?: string;
-        originalVideoMuted?: boolean;
-      }> = manifest.scenes || [];
+  interface ExportManifest {
+    title?: string;
+    aspectRatio?: string;
+    resolution?: string;
+    transitionType?: string;
+    transitionDurationSec?: number;
+    clipAudioVolume?: number;
+    voiceVolume?: number;
+    musicVolume?: number;
+    burnSubtitles?: boolean;
+    subtitles?: Array<{ startSec: number; endSec: number; text: string }>;
+    scenes?: ExportSceneInput[];
+  }
 
-      if (scenes.length === 0) {
-        res.status(400).json({ error: 'Agrega al menos una escena antes de exportar.' });
-        return;
-      }
+  interface ExportJobState {
+    id: string;
+    workDir: string;
+    manifest: ExportManifest;
+    assets: Map<string, string>;
+    status: 'uploading' | 'rendering' | 'done' | 'error';
+    progress: string;
+    outputPath?: string;
+    error?: string;
+  }
 
-      const fileMap = new Map<string, Express.Multer.File>();
-      for (const f of uploadedFiles) {
-        fileMap.set(f.fieldname, f);
-      }
+  const exportJobs = new Map<string, ExportJobState>();
 
-      const aspectRatio = String(manifest.aspectRatio || '16:9');
-      const resolution = String(manifest.resolution || '720p');
-      const { width, height } = getResolutionDims(aspectRatio, resolution);
-      const transitionType = String(manifest.transitionType || 'none');
-      const rawTransDur = Number(manifest.transitionDurationSec) || 0.6;
-      const clipAudioVolume = Math.max(0, Math.min(1.5, Number(manifest.clipAudioVolume ?? 0.6)));
-      const voiceVolume = Math.max(0, Math.min(2.0, Number(manifest.voiceVolume ?? 1.0)));
-      const musicVolume = Math.max(0, Math.min(1.5, Number(manifest.musicVolume ?? 0.25)));
-      const burnSubtitles = Boolean(manifest.burnSubtitles);
+  async function renderExportPipeline(
+    workDir: string,
+    manifest: ExportManifest,
+    assetPathMap: Map<string, string>,
+    onProgress?: (msg: string) => void
+  ): Promise<{ finalOutPath: string; safeTitle: string }> {
+    const scenes = manifest.scenes || [];
+    if (scenes.length === 0) {
+      throw new Error('Agrega al menos una escena antes de exportar.');
+    }
 
-      const normalizedSegments: Array<{ path: string; duration: number; sceneId: string }> = [];
+    const aspectRatio = String(manifest.aspectRatio || '16:9');
+    const resolution = String(manifest.resolution || '720p');
+    const { width, height } = getResolutionDims(aspectRatio, resolution);
+    const transitionType = String(manifest.transitionType || 'none');
+    const rawTransDur = Number(manifest.transitionDurationSec) || 0.6;
+    const clipAudioVolume = Math.max(0, Math.min(1.5, Number(manifest.clipAudioVolume ?? 0.6)));
+    const voiceVolume = Math.max(0, Math.min(2.0, Number(manifest.voiceVolume ?? 1.0)));
+    const musicVolume = Math.max(0, Math.min(1.5, Number(manifest.musicVolume ?? 0.25)));
+    const burnSubtitles = Boolean(manifest.burnSubtitles);
 
-      // Normalize every scene into a uniform 30fps, WxH, yuv420p, aac 48kHz stereo MP4
-      for (let i = 0; i < scenes.length; i++) {
-        const sc = scenes[i];
-        const segOut = path.join(workDir, `seg_${i}.mp4`);
-        const clipFile = fileMap.get(`clip_${sc.id}`);
-        const imgFile = fileMap.get(`image_${sc.id}`);
-        const gradeFilter = buildColorGradeFilter(sc.colorGrade);
+    const normalizedSegments: Array<{ path: string; duration: number; sceneId: string }> = [];
 
-        if (clipFile) {
-          const probe = await probeMedia(clipFile.path);
-          const vFilters = [
-            `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1`,
-            gradeFilter,
-            sc.overlayCaption
-              ? `drawtext=fontfile=${FONT_PATH}:text='${escapeDrawtext(sc.overlayCaption)}':fontcolor=white:fontsize=${Math.round(height * 0.038)}:box=1:boxcolor=black@0.58:boxborderw=14:x=48:y=h-text_h-48`
-              : null,
-            'fps=30,format=yuv420p',
-          ]
-            .filter(Boolean)
-            .join(',');
+    for (let i = 0; i < scenes.length; i++) {
+      const sc = scenes[i];
+      onProgress?.(`Renderizando escena ${i + 1} de ${scenes.length}...`);
+      const segOut = path.join(workDir, `seg_${i}.mp4`);
+      const clipPath = assetPathMap.get(`clip_${sc.id}`);
+      const imgPath = assetPathMap.get(`image_${sc.id}`);
+      const gradeFilter = buildColorGradeFilter(sc.colorGrade);
 
-          if (probe.hasAudio && !sc.originalVideoMuted && clipAudioVolume > 0) {
-            await runCommand('ffmpeg', [
-              '-y',
-              '-i',
-              clipFile.path,
-              '-vf',
-              vFilters,
-              '-af',
-              `volume=${clipAudioVolume.toFixed(2)},aresample=48000,aformat=channel_layouts=stereo`,
-              '-c:v',
-              'libx264',
-              '-preset',
-              'fast',
-              '-crf',
-              '21',
-              '-c:a',
-              'aac',
-              '-b:a',
-              '128k',
-              '-shortest',
-              segOut,
-            ]);
-          } else {
-            await runCommand('ffmpeg', [
-              '-y',
-              '-i',
-              clipFile.path,
-              '-f',
-              'lavfi',
-              '-i',
-              'anullsrc=channel_layout=stereo:sample_rate=48000',
-              '-vf',
-              vFilters,
-              '-map',
-              '0:v',
-              '-map',
-              '1:a',
-              '-c:v',
-              'libx264',
-              '-preset',
-              'fast',
-              '-crf',
-              '21',
-              '-c:a',
-              'aac',
-              '-b:a',
-              '128k',
-              '-shortest',
-              segOut,
-            ]);
-          }
-        } else if (imgFile) {
-          const dur = Math.max(2, Number(sc.durationSec) || 6);
-          const vFilters = [
-            buildZoompanFilter(sc.cameraMotion, width, height, dur),
-            gradeFilter,
-            sc.overlayCaption
-              ? `drawtext=fontfile=${FONT_PATH}:text='${escapeDrawtext(sc.overlayCaption)}':fontcolor=white:fontsize=${Math.round(height * 0.038)}:box=1:boxcolor=black@0.58:boxborderw=14:x=48:y=h-text_h-48`
-              : null,
-            'format=yuv420p',
-          ]
-            .filter(Boolean)
-            .join(',');
+      if (clipPath) {
+        const probe = await probeMedia(clipPath);
+        const vFilters = [
+          `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1`,
+          gradeFilter,
+          sc.overlayCaption
+            ? `drawtext=fontfile=${FONT_PATH}:text='${escapeDrawtext(sc.overlayCaption)}':fontcolor=white:fontsize=${Math.round(height * 0.038)}:box=1:boxcolor=black@0.58:boxborderw=14:x=48:y=h-text_h-48`
+            : null,
+          'fps=30,format=yuv420p',
+        ]
+          .filter(Boolean)
+          .join(',');
 
-          const inputArgs =
-            sc.cameraMotion === 'static'
-              ? ['-loop', '1', '-t', String(dur), '-i', imgFile.path]
-              : ['-i', imgFile.path];
-
+        if (probe.hasAudio && !sc.originalVideoMuted && clipAudioVolume > 0) {
           await runCommand('ffmpeg', [
             '-y',
-            ...inputArgs,
+            '-i',
+            clipPath,
+            '-vf',
+            vFilters,
+            '-af',
+            `volume=${clipAudioVolume.toFixed(2)},aresample=48000,aformat=channel_layouts=stereo`,
+            '-c:v',
+            'libx264',
+            '-preset',
+            'fast',
+            '-crf',
+            '21',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '128k',
+            '-shortest',
+            segOut,
+          ]);
+        } else {
+          await runCommand('ffmpeg', [
+            '-y',
+            '-i',
+            clipPath,
             '-f',
             'lavfi',
             '-i',
@@ -1380,8 +1561,6 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             '0:v',
             '-map',
             '1:a',
-            '-t',
-            String(dur),
             '-c:v',
             'libx264',
             '-preset',
@@ -1392,123 +1571,43 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             'aac',
             '-b:a',
             '128k',
-            segOut,
-          ]);
-        } else {
-          // Clean dark editorial title slate when scene has no visual media yet
-          const dur = Math.max(2, Number(sc.durationSec) || 5);
-          const cardText = escapeDrawtext(sc.title || `Escena ${i + 1}`);
-          const subText = escapeDrawtext((sc.overlayCaption || sc.subtitleText || '').slice(0, 72));
-          const drawSub = subText
-            ? `,drawtext=fontfile=${FONT_PATH}:text='${subText}':fontcolor=#9CA3AF:fontsize=${Math.round(height * 0.028)}:x=(w-text_w)/2:y=(h/2)+34`
-            : '';
-
-          await runCommand('ffmpeg', [
-            '-y',
-            '-f',
-            'lavfi',
-            '-i',
-            `color=c=0x13161D:s=${width}x${height}:r=30:d=${dur}`,
-            '-f',
-            'lavfi',
-            '-i',
-            'anullsrc=channel_layout=stereo:sample_rate=48000',
-            '-vf',
-            `drawtext=fontfile=${FONT_PATH}:text='${cardText}':fontcolor=#F1F3F6:fontsize=${Math.round(height * 0.048)}:x=(w-text_w)/2:y=(h/2)-24${drawSub},format=yuv420p`,
-            '-map',
-            '0:v',
-            '-map',
-            '1:a',
-            '-t',
-            String(dur),
-            '-c:v',
-            'libx264',
-            '-preset',
-            'fast',
-            '-crf',
-            '21',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '128k',
+            '-shortest',
             segOut,
           ]);
         }
+      } else if (imgPath) {
+        const dur = Math.max(2, Number(sc.durationSec) || 6);
+        const vFilters = [
+          buildZoompanFilter(sc.cameraMotion, width, height, dur),
+          gradeFilter,
+          sc.overlayCaption
+            ? `drawtext=fontfile=${FONT_PATH}:text='${escapeDrawtext(sc.overlayCaption)}':fontcolor=white:fontsize=${Math.round(height * 0.038)}:box=1:boxcolor=black@0.58:boxborderw=14:x=48:y=h-text_h-48`
+            : null,
+          'format=yuv420p',
+        ]
+          .filter(Boolean)
+          .join(',');
 
-        const segProbe = await probeMedia(segOut);
-        normalizedSegments.push({
-          path: segOut,
-          duration: Math.max(1, segProbe.duration || sc.durationSec || 5),
-          sceneId: sc.id,
-        });
-      }
+        const inputArgs =
+          sc.cameraMotion === 'static'
+            ? ['-loop', '1', '-t', String(dur), '-i', imgPath]
+            : ['-i', imgPath];
 
-      // Compute start offsets of each scene (accounting for transitions)
-      const minDur = Math.min(...normalizedSegments.map((s) => s.duration));
-      const useFade = transitionType === 'fade' && normalizedSegments.length > 1;
-      const transDur = useFade ? Math.min(rawTransDur, Math.max(0.2, minDur * 0.35)) : 0;
-
-      const sceneStartTimes: number[] = [];
-      let cursor = 0;
-      for (let i = 0; i < normalizedSegments.length; i++) {
-        sceneStartTimes.push(cursor);
-        cursor += normalizedSegments[i].duration - (i < normalizedSegments.length - 1 ? transDur : 0);
-      }
-      const totalVideoDuration = Math.max(1, cursor);
-
-      // Step 2: Concatenate video segments
-      const concatVideoPath = path.join(workDir, 'concat.mp4');
-      if (normalizedSegments.length === 1) {
-        await fsp.copyFile(normalizedSegments[0].path, concatVideoPath);
-      } else if (!useFade) {
-        const listPath = path.join(workDir, 'concat_list.txt');
-        const listBody = normalizedSegments.map((s) => `file '${s.path.replace(/'/g, "'\\''")}'`).join('\n');
-        await fsp.writeFile(listPath, listBody, 'utf8');
         await runCommand('ffmpeg', [
           '-y',
+          ...inputArgs,
           '-f',
-          'concat',
-          '-safe',
-          '0',
+          'lavfi',
           '-i',
-          listPath,
-          '-c',
-          'copy',
-          concatVideoPath,
-        ]);
-      } else {
-        const inputs: string[] = [];
-        for (const seg of normalizedSegments) {
-          inputs.push('-i', seg.path);
-        }
-        const filterParts: string[] = [];
-        let prevV = '[0:v]';
-        let prevA = '[0:a]';
-        let runningOffset = normalizedSegments[0].duration - transDur;
-
-        for (let i = 1; i < normalizedSegments.length; i++) {
-          const outV = i === normalizedSegments.length - 1 ? '[vout]' : `[vx${i}]`;
-          const outA = i === normalizedSegments.length - 1 ? '[aout]' : `[ax${i}]`;
-          filterParts.push(
-            `${prevV}[${i}:v]xfade=transition=fade:duration=${transDur.toFixed(3)}:offset=${Math.max(0.1, runningOffset).toFixed(3)}${outV}`
-          );
-          filterParts.push(
-            `${prevA}[${i}:a]acrossfade=d=${transDur.toFixed(3)}:c1=tri:c2=tri${outA}`
-          );
-          prevV = outV;
-          prevA = outA;
-          runningOffset += normalizedSegments[i].duration - transDur;
-        }
-
-        await runCommand('ffmpeg', [
-          '-y',
-          ...inputs,
-          '-filter_complex',
-          filterParts.join(';'),
+          'anullsrc=channel_layout=stereo:sample_rate=48000',
+          '-vf',
+          vFilters,
           '-map',
-          '[vout]',
+          '0:v',
           '-map',
-          '[aout]',
+          '1:a',
+          '-t',
+          String(dur),
           '-c:v',
           'libx264',
           '-preset',
@@ -1519,143 +1618,362 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           'aac',
           '-b:a',
           '128k',
-          concatVideoPath,
+          segOut,
+        ]);
+      } else {
+        const dur = Math.max(2, Number(sc.durationSec) || 5);
+        const cardText = escapeDrawtext(sc.title || `Escena ${i + 1}`);
+        const subText = escapeDrawtext((sc.overlayCaption || sc.subtitleText || '').slice(0, 72));
+        const drawSub = subText
+          ? `,drawtext=fontfile=${FONT_PATH}:text='${subText}':fontcolor=#9CA3AF:fontsize=${Math.round(height * 0.028)}:x=(w-text_w)/2:y=(h/2)+34`
+          : '';
+
+        await runCommand('ffmpeg', [
+          '-y',
+          '-f',
+          'lavfi',
+          '-i',
+          `color=c=0x13161D:s=${width}x${height}:r=30:d=${dur}`,
+          '-f',
+          'lavfi',
+          '-i',
+          'anullsrc=channel_layout=stereo:sample_rate=48000',
+          '-vf',
+          `drawtext=fontfile=${FONT_PATH}:text='${cardText}':fontcolor=#F1F3F6:fontsize=${Math.round(height * 0.048)}:x=(w-text_w)/2:y=(h/2)-24${drawSub},format=yuv420p`,
+          '-map',
+          '0:v',
+          '-map',
+          '1:a',
+          '-t',
+          String(dur),
+          '-c:v',
+          'libx264',
+          '-preset',
+          'fast',
+          '-crf',
+          '21',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          segOut,
         ]);
       }
 
-      // Step 3: Mix voiceover tracks + background music + optional burned-in subtitles
-      const finalOutPath = path.join(workDir, 'final_export.mp4');
-      const voiceFiles: Array<{ path: string; startSec: number }> = [];
-      for (let i = 0; i < normalizedSegments.length; i++) {
-        const audioFile = fileMap.get(`audio_${normalizedSegments[i].sceneId}`);
-        if (audioFile) {
-          voiceFiles.push({ path: audioFile.path, startSec: sceneStartTimes[i] });
-        }
+      const segProbe = await probeMedia(segOut);
+      normalizedSegments.push({
+        path: segOut,
+        duration: Math.max(1, segProbe.duration || sc.durationSec || 5),
+        sceneId: sc.id,
+      });
+    }
+
+    onProgress?.('Uniendo escenas y transiciones...');
+    const minDur = Math.min(...normalizedSegments.map((s) => s.duration));
+    const useFade = transitionType === 'fade' && normalizedSegments.length > 1;
+    const transDur = useFade ? Math.min(rawTransDur, Math.max(0.2, minDur * 0.35)) : 0;
+
+    const sceneStartTimes: number[] = [];
+    let cursor = 0;
+    for (let i = 0; i < normalizedSegments.length; i++) {
+      sceneStartTimes.push(cursor);
+      cursor += normalizedSegments[i].duration - (i < normalizedSegments.length - 1 ? transDur : 0);
+    }
+    const totalVideoDuration = Math.max(1, cursor);
+
+    const concatVideoPath = path.join(workDir, 'concat.mp4');
+    if (normalizedSegments.length === 1) {
+      await fsp.copyFile(normalizedSegments[0].path, concatVideoPath);
+    } else if (!useFade) {
+      const listPath = path.join(workDir, 'concat_list.txt');
+      const listBody = normalizedSegments.map((s) => `file '${s.path.replace(/'/g, "'\\''")}'`).join('\n');
+      await fsp.writeFile(listPath, listBody, 'utf8');
+      await runCommand('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatVideoPath]);
+    } else {
+      const inputs: string[] = [];
+      for (const seg of normalizedSegments) {
+        inputs.push('-i', seg.path);
       }
-      const musicFile = fileMap.get('music_track');
+      const filterParts: string[] = [];
+      let prevV = '[0:v]';
+      let prevA = '[0:a]';
+      let runningOffset = normalizedSegments[0].duration - transDur;
 
-      let srtPath: string | null = null;
-      if (burnSubtitles) {
-        const manualCues: Array<{ startSec: number; endSec: number; text: string }> = Array.isArray(manifest.subtitles)
-          ? manifest.subtitles
-          : [];
-        const cuesToWrite =
-          manualCues.length > 0
-            ? manualCues
-            : scenes
-                .map((sc, idx) => ({
-                  startSec: sceneStartTimes[idx],
-                  endSec: sceneStartTimes[idx] + normalizedSegments[idx].duration - 0.15,
-                  text: (sc.subtitleText || sc.narration || '').trim(),
-                }))
-                .filter((c) => c.text.length > 0);
-
-        if (cuesToWrite.length > 0) {
-          srtPath = path.join(workDir, 'subtitles.srt');
-          const srtBody = cuesToWrite
-            .map((c, idx) => `${idx + 1}\n${formatSrtTime(c.startSec)} --> ${formatSrtTime(c.endSec)}\n${c.text}\n`)
-            .join('\n');
-          await fsp.writeFile(srtPath, srtBody, 'utf8');
-        }
+      for (let i = 1; i < normalizedSegments.length; i++) {
+        const outV = i === normalizedSegments.length - 1 ? '[vout]' : `[vx${i}]`;
+        const outA = i === normalizedSegments.length - 1 ? '[aout]' : `[ax${i}]`;
+        filterParts.push(
+          `${prevV}[${i}:v]xfade=transition=fade:duration=${transDur.toFixed(3)}:offset=${Math.max(0.1, runningOffset).toFixed(3)}${outV}`
+        );
+        filterParts.push(`${prevA}[${i}:a]acrossfade=d=${transDur.toFixed(3)}:c1=tri:c2=tri${outA}`);
+        prevV = outV;
+        prevA = outA;
+        runningOffset += normalizedSegments[i].duration - transDur;
       }
 
-      const needsAudioMix = voiceFiles.length > 0 || Boolean(musicFile);
-      const needsSubBurn = Boolean(srtPath);
+      await runCommand('ffmpeg', [
+        '-y',
+        ...inputs,
+        '-filter_complex',
+        filterParts.join(';'),
+        '-map',
+        '[vout]',
+        '-map',
+        '[aout]',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'fast',
+        '-crf',
+        '21',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        concatVideoPath,
+      ]);
+    }
 
-      if (!needsAudioMix && !needsSubBurn) {
-        await fsp.copyFile(concatVideoPath, finalOutPath);
+    onProgress?.('Mezclando voces, música y subtítulos...');
+    const finalOutPath = path.join(workDir, 'final_export.mp4');
+    const voiceFiles: Array<{ path: string; startSec: number }> = [];
+    for (let i = 0; i < normalizedSegments.length; i++) {
+      const audioPath = assetPathMap.get(`audio_${normalizedSegments[i].sceneId}`);
+      if (audioPath) {
+        voiceFiles.push({ path: audioPath, startSec: sceneStartTimes[i] });
+      }
+    }
+    const musicPath = assetPathMap.get('music_track');
+
+    let srtPath: string | null = null;
+    if (burnSubtitles) {
+      const manualCues = Array.isArray(manifest.subtitles) ? manifest.subtitles : [];
+      const cuesToWrite =
+        manualCues.length > 0
+          ? manualCues
+          : scenes
+              .map((sc, idx) => ({
+                startSec: sceneStartTimes[idx],
+                endSec: sceneStartTimes[idx] + normalizedSegments[idx].duration - 0.15,
+                text: (sc.subtitleText || sc.narration || '').trim(),
+              }))
+              .filter((c) => c.text.length > 0);
+
+      if (cuesToWrite.length > 0) {
+        srtPath = path.join(workDir, 'subtitles.srt');
+        const srtBody = cuesToWrite
+          .map((c, idx) => `${idx + 1}\n${formatSrtTime(c.startSec)} --> ${formatSrtTime(c.endSec)}\n${c.text}\n`)
+          .join('\n');
+        await fsp.writeFile(srtPath, srtBody, 'utf8');
+      }
+    }
+
+    const needsAudioMix = voiceFiles.length > 0 || Boolean(musicPath);
+    const needsSubBurn = Boolean(srtPath);
+
+    if (!needsAudioMix && !needsSubBurn) {
+      await fsp.copyFile(concatVideoPath, finalOutPath);
+    } else {
+      const mixArgs: string[] = ['-y', '-i', concatVideoPath];
+      const filterLines: string[] = [];
+      const voiceLabels: string[] = [];
+      let nextIdx = 1;
+
+      for (const vf of voiceFiles) {
+        mixArgs.push('-i', vf.path);
+        const delayMs = Math.max(0, Math.round(vf.startSec * 1000));
+        const lbl = `[va${nextIdx}]`;
+        filterLines.push(
+          `[${nextIdx}:a]aresample=48000,aformat=channel_layouts=stereo,volume=${voiceVolume.toFixed(2)},adelay=${delayMs}|${delayMs}${lbl}`
+        );
+        voiceLabels.push(lbl);
+        nextIdx++;
+      }
+
+      let musicLabel: string | null = null;
+      if (musicPath) {
+        mixArgs.push('-stream_loop', '-1', '-i', musicPath);
+        const rawMusicLbl = `[ma_raw${nextIdx}]`;
+        const fadeOutStart = Math.max(0, totalVideoDuration - 2.0);
+        filterLines.push(
+          `[${nextIdx}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=0:${totalVideoDuration.toFixed(2)},asetpts=PTS-STARTPTS,volume=${musicVolume.toFixed(2)},afade=t=in:st=0:d=1.2,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=2.0${rawMusicLbl}`
+        );
+        musicLabel = rawMusicLbl;
+        nextIdx++;
+      }
+
+      const finalMixInputs: string[] = ['[0:a]'];
+      if (voiceLabels.length > 0 && musicLabel) {
+        if (voiceLabels.length === 1) {
+          filterLines.push(`${voiceLabels[0]}asplit=2[vbus_mix][vbus_rawsc]`);
+        } else {
+          filterLines.push(
+            `${voiceLabels.join('')}amix=inputs=${voiceLabels.length}:duration=longest:normalize=0,asplit=2[vbus_mix][vbus_rawsc]`
+          );
+        }
+        filterLines.push(
+          `[vbus_rawsc]apad=whole_dur=${totalVideoDuration.toFixed(2)},atrim=0:${totalVideoDuration.toFixed(2)}[vbus_sc]`
+        );
+        filterLines.push(
+          `${musicLabel}[vbus_sc]sidechaincompress=threshold=0.015:ratio=5:attack=120:release=420[ma_ducked]`
+        );
+        finalMixInputs.push('[vbus_mix]', '[ma_ducked]');
       } else {
-        const mixArgs: string[] = ['-y', '-i', concatVideoPath];
-        const filterLines: string[] = [];
-        const voiceLabels: string[] = [];
-        let nextIdx = 1;
-
-        for (const vf of voiceFiles) {
-          mixArgs.push('-i', vf.path);
-          const delayMs = Math.max(0, Math.round(vf.startSec * 1000));
-          const lbl = `[va${nextIdx}]`;
-          filterLines.push(
-            `[${nextIdx}:a]aresample=48000,aformat=channel_layouts=stereo,volume=${voiceVolume.toFixed(2)},adelay=${delayMs}|${delayMs}${lbl}`
-          );
-          voiceLabels.push(lbl);
-          nextIdx++;
-        }
-
-        let musicLabel: string | null = null;
-        if (musicFile) {
-          mixArgs.push('-stream_loop', '-1', '-i', musicFile.path);
-          const rawMusicLbl = `[ma_raw${nextIdx}]`;
-          const fadeOutStart = Math.max(0, totalVideoDuration - 2.0);
-          filterLines.push(
-            `[${nextIdx}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=0:${totalVideoDuration.toFixed(2)},asetpts=PTS-STARTPTS,volume=${musicVolume.toFixed(2)},afade=t=in:st=0:d=1.2,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=2.0${rawMusicLbl}`
-          );
-          musicLabel = rawMusicLbl;
-          nextIdx++;
-        }
-
-        const finalMixInputs: string[] = ['[0:a]'];
-
-        if (voiceLabels.length > 0 && musicLabel) {
-          // Combine voice bus and apply automatic ducking to background music
-          if (voiceLabels.length === 1) {
-            filterLines.push(`${voiceLabels[0]}asplit=2[vbus_mix][vbus_rawsc]`);
-          } else {
-            filterLines.push(
-              `${voiceLabels.join('')}amix=inputs=${voiceLabels.length}:duration=longest:normalize=0,asplit=2[vbus_mix][vbus_rawsc]`
-            );
-          }
-          filterLines.push(
-            `[vbus_rawsc]apad=whole_dur=${totalVideoDuration.toFixed(2)},atrim=0:${totalVideoDuration.toFixed(2)}[vbus_sc]`
-          );
-          filterLines.push(
-            `${musicLabel}[vbus_sc]sidechaincompress=threshold=0.015:ratio=5:attack=120:release=420[ma_ducked]`
-          );
-          finalMixInputs.push('[vbus_mix]', '[ma_ducked]');
-        } else {
-          if (voiceLabels.length > 0) {
-            finalMixInputs.push(...voiceLabels);
-          }
-          if (musicLabel) {
-            finalMixInputs.push(musicLabel);
-          }
-        }
-
-        if (finalMixInputs.length > 1) {
-          filterLines.push(
-            `${finalMixInputs.join('')}amix=inputs=${finalMixInputs.length}:duration=first:dropout_transition=2:normalize=0[amixed]`
-          );
-        }
-
-        if (srtPath) {
-          const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-          filterLines.push(
-            `[0:v]subtitles='${escapedSrt}':force_style='FontName=Noto Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=3,Outline=1,MarginV=32'[vsub]`
-          );
-        }
-
-        if (filterLines.length > 0) {
-          mixArgs.push('-filter_complex', filterLines.join(';'));
-        }
-
-        mixArgs.push('-map', srtPath ? '[vsub]' : '0:v');
-        mixArgs.push('-map', finalMixInputs.length > 1 ? '[amixed]' : '0:a');
-
-        if (srtPath) {
-          mixArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '20');
-        } else {
-          mixArgs.push('-c:v', 'copy');
-        }
-        mixArgs.push('-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', finalOutPath);
-
-        await runCommand('ffmpeg', mixArgs);
+        if (voiceLabels.length > 0) finalMixInputs.push(...voiceLabels);
+        if (musicLabel) finalMixInputs.push(musicLabel);
       }
 
-      const finalBuffer = await fsp.readFile(finalOutPath);
-      const safeTitle = String(manifest.title || 'cinecraft-video')
+      if (finalMixInputs.length > 1) {
+        filterLines.push(
+          `${finalMixInputs.join('')}amix=inputs=${finalMixInputs.length}:duration=first:dropout_transition=2:normalize=0[amixed]`
+        );
+      }
+
+      if (srtPath) {
+        const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        filterLines.push(
+          `[0:v]subtitles='${escapedSrt}':force_style='FontName=Noto Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=3,Outline=1,MarginV=32'[vsub]`
+        );
+      }
+
+      if (filterLines.length > 0) {
+        mixArgs.push('-filter_complex', filterLines.join(';'));
+      }
+
+      mixArgs.push('-map', srtPath ? '[vsub]' : '0:v');
+      mixArgs.push('-map', finalMixInputs.length > 1 ? '[amixed]' : '0:a');
+      if (srtPath) {
+        mixArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '20');
+      } else {
+        mixArgs.push('-c:v', 'copy');
+      }
+      mixArgs.push('-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', finalOutPath);
+
+      await runCommand('ffmpeg', mixArgs);
+    }
+
+    const safeTitle =
+      String(manifest.title || 'cinecraft-video')
         .toLowerCase()
         .replace(/[^a-z0-9-_]+/g, '-')
         .replace(/^-|-$/g, '') || 'cinecraft-video';
 
+    return { finalOutPath, safeTitle };
+  }
+
+  // 7A. Chunked Export Job Endpoints (prevents HTTP timeouts & 32MB proxy payload limits)
+  app.post('/api/export/start', async (req, res) => {
+    try {
+      const manifest = req.body?.manifest as ExportManifest | undefined;
+      if (!manifest || !Array.isArray(manifest.scenes) || manifest.scenes.length === 0) {
+        res.status(400).json({ error: 'Manifiesto de exportación inválido.' });
+        return;
+      }
+      const workDir = await fsp.mkdtemp(path.join(TEMP_ROOT, 'job-'));
+      const jobId = `exp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+      exportJobs.set(jobId, {
+        id: jobId,
+        workDir,
+        manifest,
+        assets: new Map<string, string>(),
+        status: 'uploading',
+        progress: 'Subiendo archivos...',
+      });
+      res.json({ jobId });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Error iniciando exportación.' });
+    }
+  });
+
+  app.post('/api/export/:jobId/asset', upload.single('file'), async (req, res) => {
+    const job = exportJobs.get(req.params.jobId);
+    const key = String(req.body?.key || '');
+    if (!job || !req.file || !key) {
+      await safeUnlink(req.file?.path);
+      res.status(400).json({ error: 'Trabajo o archivo inválido.' });
+      return;
+    }
+    const dest = path.join(job.workDir, `asset_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
+    await fsp.rename(req.file.path, dest);
+    job.assets.set(key, dest);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/export/:jobId/render', (req, res) => {
+    const job = exportJobs.get(req.params.jobId);
+    if (!job) {
+      res.status(404).json({ error: 'Trabajo de exportación no encontrado.' });
+      return;
+    }
+    job.status = 'rendering';
+    job.progress = 'Iniciando renderizado FFmpeg...';
+
+    renderExportPipeline(job.workDir, job.manifest, job.assets, (msg) => {
+      job.progress = msg;
+    })
+      .then(({ finalOutPath }) => {
+        job.outputPath = finalOutPath;
+        job.status = 'done';
+        job.progress = 'Video listo para descargar';
+      })
+      .catch((err) => {
+        job.status = 'error';
+        job.error = err instanceof Error ? err.message : 'Error al renderizar MP4.';
+      });
+
+    res.json({ status: 'rendering' });
+  });
+
+  app.get('/api/export/:jobId/status', (req, res) => {
+    const job = exportJobs.get(req.params.jobId);
+    if (!job) {
+      res.status(404).json({ error: 'Trabajo no encontrado.' });
+      return;
+    }
+    res.json({
+      status: job.status,
+      progress: job.progress,
+      error: job.error,
+    });
+  });
+
+  app.get('/api/export/:jobId/download', async (req, res) => {
+    const job = exportJobs.get(req.params.jobId);
+    if (!job || job.status !== 'done' || !job.outputPath) {
+      res.status(404).json({ error: 'El video aún no está listo.' });
+      return;
+    }
+    const safeTitle =
+      String(job.manifest.title || 'cinecraft-video')
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]+/g, '-')
+        .replace(/^-|-$/g, '') || 'cinecraft-video';
+
+    res.download(job.outputPath, `${safeTitle}.mp4`, async () => {
+      exportJobs.delete(job.id);
+      await safeRmDir(job.workDir);
+    });
+  });
+
+  // 7B. Legacy single-request /api/export/mp4 (delegates to renderExportPipeline)
+  app.post('/api/export/mp4', upload.any(), async (req, res) => {
+    const uploadedFiles = (req.files as Express.Multer.File[]) || [];
+    const workDir = await fsp.mkdtemp(path.join(TEMP_ROOT, 'export-'));
+
+    try {
+      const manifestRaw = req.body?.manifest;
+      if (!manifestRaw) {
+        res.status(400).json({ error: 'Manifiesto de exportación requerido.' });
+        return;
+      }
+      const manifest = JSON.parse(manifestRaw) as ExportManifest;
+      const assetMap = new Map<string, string>();
+      for (const f of uploadedFiles) {
+        assetMap.set(f.fieldname, f.path);
+      }
+
+      const { finalOutPath, safeTitle } = await renderExportPipeline(workDir, manifest, assetMap);
+      const finalBuffer = await fsp.readFile(finalOutPath);
       res.setHeader('Content-Type', 'video/mp4');
       res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
       res.send(finalBuffer);

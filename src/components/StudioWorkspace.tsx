@@ -31,6 +31,7 @@ import {
 } from '../types/studio';
 import { createEmptyScene, saveMediaBlob, uid } from '../lib/storage';
 import { generateEditorialSlateImage, SlatePalette } from '../lib/canvasCards';
+import { safeErrorMessage, safeJson } from '../lib/exportClient';
 import { formatTimecode, useBlobUrl } from '../hooks/useBlobUrl';
 
 interface StudioWorkspaceProps {
@@ -340,8 +341,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
         body: fd,
       });
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Error al animar la imagen.');
+        throw new Error(await safeErrorMessage(res, 'Error al animar la imagen.'));
       }
       const mp4Blob = await res.blob();
       const clipBlobId = await saveMediaBlob(mp4Blob);
@@ -404,8 +404,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
         body: fd,
       });
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Error al adaptar el video.');
+        throw new Error(await safeErrorMessage(res, 'Error al adaptar el video.'));
       }
       const outDur = Number(res.headers.get('X-Video-Duration')) || selectedScene.durationSec;
       const mp4Blob = await res.blob();
@@ -439,7 +438,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
           dialogueLines: selectedScene.dialogueLines,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'Error al generar voz.');
 
       const wavBlob = base64ToBlob(data.audioBase64, data.mimeType || 'audio/wav');
@@ -474,7 +473,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
           language: project.language,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.error || 'Error al consultar al asistente.');
 
       if (action === 'extend') {
@@ -928,8 +927,9 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
                               }),
                             });
                             if (!res.ok) {
-                              const errData = await res.json().catch(() => ({}));
-                              throw new Error(errData.error || 'No se encontró visual automático.');
+                              throw new Error(
+                                await safeErrorMessage(res, 'No se encontró visual automático.')
+                              );
                             }
                             const kind = res.headers.get('X-Media-Kind');
                             const src = res.headers.get('X-Media-Source') || 'banco libre';
