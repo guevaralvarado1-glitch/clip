@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import { Project, SubtitleCue, TransitionType } from '../types/studio';
 import { saveMediaBlob, uid } from '../lib/storage';
-import { safeJson } from '../lib/exportClient';
+import { apiFetch, safeJson } from '../lib/exportClient';
 import { formatTimecode, useBlobUrl } from '../hooks/useBlobUrl';
 
 interface AudioSubtitlesViewProps {
@@ -86,7 +86,7 @@ export const AudioSubtitlesView: React.FC<AudioSubtitlesViewProps> = ({
         const scene = pending[i];
         setBatchProgress(`Generando voz ${i + 1} de ${pending.length}: ${scene.title}`);
 
-        const res = await fetch('/api/ai/tts', {
+        const res = await apiFetch('/api/ai/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -158,7 +158,7 @@ export const AudioSubtitlesView: React.FC<AudioSubtitlesViewProps> = ({
       setTranscribing(true);
       const fd = new FormData();
       fd.append('file', file);
-      const res = await fetch('/api/ai/transcribe', {
+      const res = await apiFetch('/api/ai/transcribe', {
         method: 'POST',
         body: fd,
       });

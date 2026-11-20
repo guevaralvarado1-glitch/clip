@@ -31,7 +31,7 @@ import {
 } from '../types/studio';
 import { createEmptyScene, saveMediaBlob, uid } from '../lib/storage';
 import { generateEditorialSlateImage, SlatePalette } from '../lib/canvasCards';
-import { safeErrorMessage, safeJson } from '../lib/exportClient';
+import { apiFetch, safeErrorMessage, safeJson } from '../lib/exportClient';
 import { formatTimecode, useBlobUrl } from '../hooks/useBlobUrl';
 
 interface StudioWorkspaceProps {
@@ -336,7 +336,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
       fd.append('colorGrade', selectedScene.colorGrade);
       fd.append('overlayCaption', selectedScene.overlayCaption || '');
 
-      const res = await fetch('/api/media/image-to-video', {
+      const res = await apiFetch('/api/media/image-to-video', {
         method: 'POST',
         body: fd,
       });
@@ -399,7 +399,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
       fd.append('muteOriginal', String(Boolean(selectedScene.originalVideoMuted)));
       fd.append('overlayCaption', selectedScene.overlayCaption || '');
 
-      const res = await fetch('/api/media/process-video', {
+      const res = await apiFetch('/api/media/process-video', {
         method: 'POST',
         body: fd,
       });
@@ -426,7 +426,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
     try {
       setError(null);
       setGeneratingVoice(true);
-      const res = await fetch('/api/ai/tts', {
+      const res = await apiFetch('/api/ai/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -462,7 +462,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
     try {
       setError(null);
       setRefiningScene(true);
-      const res = await fetch('/api/ai/refine-scene', {
+      const res = await apiFetch('/api/ai/refine-scene', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -917,7 +917,7 @@ export const StudioWorkspace: React.FC<StudioWorkspaceProps> = ({
                               selectedScene.visualDirection ||
                               selectedScene.title ||
                               project.title;
-                            const res = await fetch('/api/media/fetch-stock', {
+                            const res = await apiFetch('/api/media/fetch-stock', {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
                               body: JSON.stringify({

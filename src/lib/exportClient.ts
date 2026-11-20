@@ -1,6 +1,40 @@
 import { Project } from '../types/studio';
 import { getMediaBlob } from './storage';
 
+const RETRYABLE_PROXY_STATUSES = new Set([404, 502, 503, 504]);
+
+export async function apiFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  maxRetries = 3
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(input, init);
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      const isProxyWakeupError =
+        RETRYABLE_PROXY_STATUSES.has(res.status) && !contentType.includes('application/json');
+
+      if (isProxyWakeupError && attempt < maxRetries) {
+        await new Promise((r) => window.setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        await new Promise((r) => window.setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('Error de conexión con el servidor.');
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function safeJson<T = any>(res: Response): Promise<T> {
   const raw = await res.text();
@@ -17,9 +51,14 @@ export async function safeJson<T = any>(res: Response): Promise<T> {
     if (res.status === 413) {
       throw new Error('El archivo enviado supera el límite permitido por el servidor (HTTP 413).');
     }
-    if (res.status === 504 || res.status === 502 || raw.includes('The page c')) {
+    if (res.status === 404) {
       throw new Error(
-        `La operación tardó demasiado en responder (HTTP ${res.status}). Intenta de nuevo o usa clips más ligeros.`
+        'El servidor se está reiniciando o despertando (HTTP 404). Recarga la página o intenta de nuevo en unos segundos.'
+      );
+    }
+    if (res.status === 504 || res.status === 502 || res.status === 503 || raw.includes('The page c')) {
+      throw new Error(
+        `El servidor tardó demasiado o estuvo ocupado temporalmente (HTTP ${res.status}). Intenta de nuevo en unos segundos.`
       );
     }
     const snippet = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
@@ -176,7 +215,7 @@ export async function exportProjectMp4(
   };
 
   onProgress?.('Iniciando trabajo de exportación...');
-  const startRes = await fetch('/api/export/start', {
+  const startRes = await apiFetch('/api/export/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ manifest }),
@@ -191,7 +230,7 @@ export async function exportProjectMp4(
     const fd = new FormData();
     fd.append('key', key);
     fd.append('file', blob, filename);
-    const res = await fetch(`/api/export/${jobId}/asset`, {
+    const res = await apiFetch(`/api/export/${jobId}/asset`, {
       method: 'POST',
       body: fd,
     });
@@ -201,7 +240,6 @@ export async function exportProjectMp4(
     }
   };
 
-  // Upload scene assets one by one to stay well below proxy body limits
   for (let i = 0; i < project.scenes.length; i++) {
     const sc = project.scenes[i];
     onProgress?.(`Subiendo escena ${i + 1} de ${project.scenes.length}...`);
@@ -224,19 +262,17 @@ export async function exportProjectMp4(
     if (mb) await uploadAsset('music_track', mb, project.musicFileName || 'music.mp3');
   }
 
-  // Trigger asynchronous FFmpeg render
   onProgress?.('Renderizando video en el servidor...');
-  const renderRes = await fetch(`/api/export/${jobId}/render`, { method: 'POST' });
+  const renderRes = await apiFetch(`/api/export/${jobId}/render`, { method: 'POST' });
   const renderData = await safeJson<{ status?: string; error?: string }>(renderRes);
   if (!renderRes.ok) {
     throw new Error(renderData.error || 'Error iniciando el renderizado FFmpeg.');
   }
 
-  // Poll job status until done or error
-  const maxAttempts = 240; // ~6 minutes max
+  const maxAttempts = 240;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await new Promise((r) => window.setTimeout(r, 1500));
-    const statusRes = await fetch(`/api/export/${jobId}/status`);
+    const statusRes = await apiFetch(`/api/export/${jobId}/status`);
     const statusData = await safeJson<{
       status?: 'uploading' | 'rendering' | 'done' | 'error';
       progress?: string;
@@ -260,9 +296,8 @@ export async function exportProjectMp4(
     }
   }
 
-  // Download assembled MP4
   onProgress?.('Descargando MP4 final...');
-  const dlRes = await fetch(`/api/export/${jobId}/download`);
+  const dlRes = await apiFetch(`/api/export/${jobId}/download`);
   if (!dlRes.ok) {
     throw new Error(await safeErrorMessage(dlRes, 'Error descargando el archivo MP4 final.'));
   }

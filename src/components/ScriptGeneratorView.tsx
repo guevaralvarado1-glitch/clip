@@ -10,7 +10,7 @@ import {
   Scene,
 } from '../types/studio';
 import { saveMediaBlob, uid } from '../lib/storage';
-import { safeJson } from '../lib/exportClient';
+import { apiFetch, safeJson } from '../lib/exportClient';
 
 interface ScriptGeneratorViewProps {
   project: Project;
@@ -61,7 +61,7 @@ export const ScriptGeneratorView: React.FC<ScriptGeneratorViewProps> = ({
     try {
       setError(null);
       setLoading(true);
-      const res = await fetch('/api/ai/storyboard', {
+      const res = await apiFetch('/api/ai/storyboard', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

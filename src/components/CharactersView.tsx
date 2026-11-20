@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Plus, Trash2, Upload, User, Volume2 } from 'lucide-react';
 import { Character, Project, VoiceName } from '../types/studio';
 import { saveMediaBlob, uid } from '../lib/storage';
-import { safeJson } from '../lib/exportClient';
+import { apiFetch, safeJson } from '../lib/exportClient';
 import { useBlobUrl } from '../hooks/useBlobUrl';
 
 interface CharactersViewProps {
@@ -39,7 +39,7 @@ const CharacterCard: React.FC<{
     try {
       setError(null);
       setTesting(true);
-      const res = await fetch('/api/ai/tts', {
+      const res = await apiFetch('/api/ai/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

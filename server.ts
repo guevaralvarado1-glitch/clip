@@ -225,6 +225,10 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
+  });
+
   // 0A. Autonomous Director Planner (async job + sync compatibility, with fast fallback)
   interface AutoPlanJob {
     status: 'running' | 'done' | 'error';
@@ -232,7 +236,31 @@ async function startServer() {
     error?: string;
     createdAt: number;
   }
+  const PLAN_JOBS_DIR = path.join(TEMP_ROOT, 'plan-jobs');
+  fs.mkdirSync(PLAN_JOBS_DIR, { recursive: true });
   const autoPlanJobs = new Map<string, AutoPlanJob>();
+
+  async function savePlanJob(jobId: string, job: AutoPlanJob) {
+    autoPlanJobs.set(jobId, job);
+    try {
+      await fsp.writeFile(path.join(PLAN_JOBS_DIR, `${jobId}.json`), JSON.stringify(job), 'utf8');
+    } catch {
+      // ignore disk cache error
+    }
+  }
+
+  async function loadPlanJob(jobId: string): Promise<AutoPlanJob | undefined> {
+    const mem = autoPlanJobs.get(jobId);
+    if (mem) return mem;
+    try {
+      const raw = await fsp.readFile(path.join(PLAN_JOBS_DIR, `${jobId}.json`), 'utf8');
+      const parsed = JSON.parse(raw) as AutoPlanJob;
+      autoPlanJobs.set(jobId, parsed);
+      return parsed;
+    } catch {
+      return undefined;
+    }
+  }
 
   async function runAutoPlan(
     idea: string,
@@ -385,7 +413,7 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
     }
   }
 
-  app.post('/api/ai/auto-plan/start', (req, res) => {
+  app.post('/api/ai/auto-plan/start', async (req, res) => {
     const { idea, language = 'es-ES', userMedia = [] } = req.body ?? {};
     if (!idea || typeof idea !== 'string' || !idea.trim()) {
       res.status(400).json({ error: 'Escribe una idea para iniciar el Piloto Automático.' });
@@ -393,29 +421,23 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
     }
 
     const jobId = `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-    autoPlanJobs.set(jobId, { status: 'running', createdAt: Date.now() });
+    await savePlanJob(jobId, { status: 'running', createdAt: Date.now() });
 
     runAutoPlan(idea, language, userMedia)
-      .then((plan) => {
-        const job = autoPlanJobs.get(jobId);
-        if (job) {
-          job.status = 'done';
-          job.plan = plan;
-        }
-      })
-      .catch((error) => {
-        const job = autoPlanJobs.get(jobId);
-        if (job) {
-          job.status = 'error';
-          job.error = formatAiError(error, 'Error en la planificación autónoma.');
-        }
-      });
+      .then((plan) => savePlanJob(jobId, { status: 'done', plan, createdAt: Date.now() }))
+      .catch((error) =>
+        savePlanJob(jobId, {
+          status: 'error',
+          error: formatAiError(error, 'Error en la planificación autónoma.'),
+          createdAt: Date.now(),
+        })
+      );
 
     res.json({ jobId });
   });
 
-  app.get('/api/ai/auto-plan/:jobId/status', (req, res) => {
-    const job = autoPlanJobs.get(req.params.jobId);
+  app.get('/api/ai/auto-plan/:jobId/status', async (req, res) => {
+    const job = await loadPlanJob(req.params.jobId);
     if (!job) {
       res.status(404).json({ error: 'Planificación no encontrada.' });
       return;
@@ -423,12 +445,14 @@ Toma TODAS las decisiones creativas apropiadas según la idea:
     if (job.status === 'done') {
       const plan = job.plan;
       autoPlanJobs.delete(req.params.jobId);
+      await safeUnlink(path.join(PLAN_JOBS_DIR, `${req.params.jobId}.json`));
       res.json({ status: 'done', plan });
       return;
     }
     if (job.status === 'error') {
       const error = job.error;
       autoPlanJobs.delete(req.params.jobId);
+      await safeUnlink(path.join(PLAN_JOBS_DIR, `${req.params.jobId}.json`));
       res.json({ status: 'error', error });
       return;
     }

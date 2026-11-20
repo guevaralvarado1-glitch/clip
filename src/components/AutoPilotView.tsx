@@ -1,5 +1,6 @@
 import React, { useRef, useState } from 'react';
 import {
+  AlertCircle,
   CheckCircle2,
   Circle,
   Clapperboard,
@@ -24,6 +25,7 @@ import {
 import { saveMediaBlob, uid } from '../lib/storage';
 import { generateEditorialSlateImage, SlatePalette } from '../lib/canvasCards';
 import {
+  apiFetch,
   exportProjectMp4,
   extractMediaPreviewThumbnail,
   safeJson,
@@ -37,7 +39,7 @@ interface AutoPilotViewProps {
   onOpenStudio: () => void;
 }
 
-type StepStatus = 'pending' | 'running' | 'done' | 'skipped';
+type StepStatus = 'pending' | 'running' | 'done' | 'skipped' | 'error';
 
 interface PipelineStep {
   id: string;
@@ -146,7 +148,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
             thumbnailBase64: preview.thumbnailBase64,
           });
         }
-        const analyzeRes = await fetch('/api/ai/analyze-thumbnails', {
+        const analyzeRes = await apiFetch('/api/ai/analyze-thumbnails', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: thumbItems }),
@@ -162,7 +164,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
 
       // 2. Autonomous Plan (async job polling so proxy timeout never occurs)
       updateStep('plan', { status: 'running', detail: 'Diseñando estructura narrativa...' });
-      const planStartRes = await fetch('/api/ai/auto-plan/start', {
+      const planStartRes = await apiFetch('/api/ai/auto-plan/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -184,7 +186,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
         const elapsed = Math.round((Date.now() - planStartTime) / 1000);
         updateStep('plan', { detail: `Diseñando estructura narrativa... (${elapsed}s)` });
 
-        const statusRes = await fetch(`/api/ai/auto-plan/${planStartData.jobId}/status`);
+        const statusRes = await apiFetch(`/api/ai/auto-plan/${planStartData.jobId}/status`);
         const statusData = await safeJson<{
           status?: 'running' | 'done' | 'error';
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -268,7 +270,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
         } else {
           // Fetch hybrid stock media (Pexels if configured, else Wikimedia Commons)
           try {
-            const stockRes = await fetch('/api/media/fetch-stock', {
+            const stockRes = await apiFetch('/api/media/fetch-stock', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -345,7 +347,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
         updateStep('voices', {
           detail: `Voz ${i + 1} de ${builtScenes.length}: ${sc.title}`,
         });
-        const ttsRes = await fetch('/api/ai/tts', {
+        const ttsRes = await apiFetch('/api/ai/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -377,7 +379,7 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
       let musicFileName: string | undefined;
 
       if (includeMusic) {
-        const musicRes = await fetch('/api/media/generate-music', {
+        const musicRes = await apiFetch('/api/media/generate-music', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -456,6 +458,9 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
       onOpenStudio();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error durante la producción automática.');
+      setSteps((prev) =>
+        prev.map((s) => (s.status === 'running' ? { ...s, status: 'error', detail: 'Detenido por error' } : s))
+      );
     } finally {
       setRunning(false);
     }
@@ -541,6 +546,9 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
                   {step.status === 'running' && (
                     <Loader2 className="w-4 h-4 text-[#E5A93B] animate-spin shrink-0" />
                   )}
+                  {step.status === 'error' && (
+                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                  )}
                   {(step.status === 'pending' || step.status === 'skipped') && (
                     <Circle className="w-4 h-4 text-[#4B5563] shrink-0" />
                   )}
@@ -548,6 +556,8 @@ export const AutoPilotView: React.FC<AutoPilotViewProps> = ({
                     className={
                       step.status === 'skipped'
                         ? 'text-[#6B7280]'
+                        : step.status === 'error'
+                        ? 'text-red-300 font-medium'
                         : step.status === 'running'
                         ? 'text-[#F1F3F6] font-medium'
                         : 'text-[#C8CDD8]'
