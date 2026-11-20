@@ -23,19 +23,24 @@ const upload = multer({
   limits: { fileSize: 250 * 1024 * 1024 },
 });
 
-function getAiClient(): GoogleGenAI {
+function getAiClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY no está configurada en el servidor.');
   }
   return new GoogleGenAI({
     apiKey,
+    ...(apiVersion ? { apiVersion } : {}),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
     },
   });
+}
+
+function getAiBetaClient(): GoogleGenAI {
+  return getAiClient('v1beta');
 }
 
 function isTransientAiError(err: unknown): boolean {
@@ -1154,7 +1159,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         dialogueLines = [],
       } = req.body ?? {};
 
-      const ai = getAiClient();
+      const ai = getAiBetaClient();
 
       if (isDialogue && Array.isArray(dialogueLines) && dialogueLines.length > 0) {
         const speakerMap = new Map<string, string>();
@@ -1272,14 +1277,27 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       }
 
       const probed = await probeMedia(uploadedPath);
-      const isVideo = req.file.mimetype.startsWith('video/') || (probed.hasVideo && !req.file.mimetype.startsWith('audio/'));
+      const origExt = path.extname(req.file.originalname || '').toLowerCase();
+      const extMimeMap: Record<string, string> = {
+        '.mp3': 'audio/mp3',
+        '.wav': 'audio/wav',
+        '.ogg': 'audio/ogg',
+        '.m4a': 'audio/mp4',
+        '.aac': 'audio/aac',
+        '.flac': 'audio/flac',
+        '.webm': 'audio/webm',
+      };
+      const rawMime = req.file.mimetype && req.file.mimetype !== 'application/octet-stream'
+        ? req.file.mimetype
+        : (extMimeMap[origExt] || '');
+      const isVideo = rawMime.startsWith('video/') || (probed.hasVideo && !rawMime.startsWith('audio/'));
 
       let audioPath = uploadedPath;
-      let mimeType = req.file.mimetype || 'audio/mp3';
+      let mimeType = rawMime.startsWith('audio/') ? rawMime : 'audio/mp3';
 
-      if (isVideo) {
+      if (isVideo || !rawMime.startsWith('audio/')) {
         if (!probed.hasAudio) {
-          res.status(400).json({ error: 'El video subido no contiene pista de audio para transcribir.' });
+          res.status(400).json({ error: 'El archivo subido no contiene pista de audio para transcribir.' });
           return;
         }
         await runCommand('ffmpeg', [
@@ -1300,9 +1318,10 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       const audioBuffer = await fsp.readFile(audioPath);
       const base64AudioData = audioBuffer.toString('base64');
 
+      const aiBeta = getAiBetaClient();
       const ai = getAiClient();
       const interaction = await withGeminiRetry(() =>
-        ai.interactions.create({
+        aiBeta.interactions.create({
           model: 'gemini-3.5-transcribe',
           input: [
             {
@@ -1417,6 +1436,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             '[v]',
             '-c:v',
             'libx264',
+            '-profile:v',
+            'high',
+            '-level:v',
+            '4.1',
+            '-pix_fmt',
+            'yuv420p',
             '-preset',
             'fast',
             '-crf',
@@ -1448,6 +1473,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             String(durationSec),
             '-c:v',
             'libx264',
+            '-profile:v',
+            'high',
+            '-level:v',
+            '4.1',
+            '-pix_fmt',
+            'yuv420p',
             '-preset',
             'fast',
             '-crf',
@@ -1533,7 +1564,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '48000');
       }
 
-      args.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '21', '-movflags', '+faststart', outPath);
+      args.push('-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-crf', '21', '-movflags', '+faststart', outPath);
 
       await runCommand('ffmpeg', args);
       const outBuf = await fsp.readFile(outPath);
@@ -1646,6 +1677,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             `volume=${clipAudioVolume.toFixed(2)},aresample=48000,aformat=channel_layouts=stereo`,
             '-c:v',
             'libx264',
+            '-profile:v',
+            'high',
+            '-level:v',
+            '4.1',
+            '-pix_fmt',
+            'yuv420p',
             '-preset',
             'fast',
             '-crf',
@@ -1654,6 +1691,10 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             'aac',
             '-b:a',
             '128k',
+            '-ar',
+            '48000',
+            '-ac',
+            '2',
             '-shortest',
             segOut,
           ]);
@@ -1674,6 +1715,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             '1:a',
             '-c:v',
             'libx264',
+            '-profile:v',
+            'high',
+            '-level:v',
+            '4.1',
+            '-pix_fmt',
+            'yuv420p',
             '-preset',
             'fast',
             '-crf',
@@ -1682,6 +1729,10 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
             'aac',
             '-b:a',
             '128k',
+            '-ar',
+            '48000',
+            '-ac',
+            '2',
             '-shortest',
             segOut,
           ]);
@@ -1721,6 +1772,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           String(dur),
           '-c:v',
           'libx264',
+          '-profile:v',
+          'high',
+          '-level:v',
+          '4.1',
+          '-pix_fmt',
+          'yuv420p',
           '-preset',
           'fast',
           '-crf',
@@ -1729,6 +1786,10 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           'aac',
           '-b:a',
           '128k',
+          '-ar',
+          '48000',
+          '-ac',
+          '2',
           segOut,
         ]);
       } else {
@@ -1759,6 +1820,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           String(dur),
           '-c:v',
           'libx264',
+          '-profile:v',
+          'high',
+          '-level:v',
+          '4.1',
+          '-pix_fmt',
+          'yuv420p',
           '-preset',
           'fast',
           '-crf',
@@ -1767,6 +1834,10 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
           'aac',
           '-b:a',
           '128k',
+          '-ar',
+          '48000',
+          '-ac',
+          '2',
           segOut,
         ]);
       }
@@ -1811,10 +1882,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       let runningOffset = normalizedSegments[0].duration - transDur;
 
       for (let i = 1; i < normalizedSegments.length; i++) {
-        const outV = i === normalizedSegments.length - 1 ? '[vout]' : `[vx${i}]`;
-        const outA = i === normalizedSegments.length - 1 ? '[aout]' : `[ax${i}]`;
+        const isLast = i === normalizedSegments.length - 1;
+        const outV = isLast ? '[vout]' : `[vx${i}]`;
+        const outA = isLast ? '[aout]' : `[ax${i}]`;
+        const fmtSuffix = isLast ? ',format=yuv420p' : '';
         filterParts.push(
-          `${prevV}[${i}:v]xfade=transition=fade:duration=${transDur.toFixed(3)}:offset=${Math.max(0.1, runningOffset).toFixed(3)}${outV}`
+          `${prevV}[${i}:v]xfade=transition=fade:duration=${transDur.toFixed(3)}:offset=${Math.max(0.1, runningOffset).toFixed(3)}${fmtSuffix}${outV}`
         );
         filterParts.push(`${prevA}[${i}:a]acrossfade=d=${transDur.toFixed(3)}:c1=tri:c2=tri${outA}`);
         prevV = outV;
@@ -1833,6 +1906,12 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         '[aout]',
         '-c:v',
         'libx264',
+        '-profile:v',
+        'high',
+        '-level:v',
+        '4.1',
+        '-pix_fmt',
+        'yuv420p',
         '-preset',
         'fast',
         '-crf',
@@ -1841,6 +1920,10 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
         'aac',
         '-b:a',
         '128k',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
         concatVideoPath,
       ]);
     }
@@ -1883,7 +1966,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
     const needsSubBurn = Boolean(srtPath);
 
     if (!needsAudioMix && !needsSubBurn) {
-      await fsp.copyFile(concatVideoPath, finalOutPath);
+      await runCommand('ffmpeg', ['-y', '-i', concatVideoPath, '-c', 'copy', '-movflags', '+faststart', finalOutPath]);
     } else {
       const mixArgs: string[] = ['-y', '-i', concatVideoPath];
       const filterLines: string[] = [];
@@ -1943,7 +2026,7 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       if (srtPath) {
         const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
         filterLines.push(
-          `[0:v]subtitles='${escapedSrt}':force_style='FontName=Noto Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=3,Outline=1,MarginV=32'[vsub]`
+          `[0:v]subtitles='${escapedSrt}':force_style='FontName=Noto Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=3,Outline=1,MarginV=32',format=yuv420p[vsub]`
         );
       }
 
@@ -1954,11 +2037,11 @@ Instrucción del usuario: "${instruction || 'Mejora el ritmo narrativo y el deta
       mixArgs.push('-map', srtPath ? '[vsub]' : '0:v');
       mixArgs.push('-map', finalMixInputs.length > 1 ? '[amixed]' : '0:a');
       if (srtPath) {
-        mixArgs.push('-c:v', 'libx264', '-preset', 'fast', '-crf', '20');
+        mixArgs.push('-c:v', 'libx264', '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-crf', '20');
       } else {
         mixArgs.push('-c:v', 'copy');
       }
-      mixArgs.push('-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', finalOutPath);
+      mixArgs.push('-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart', finalOutPath);
 
       await runCommand('ffmpeg', mixArgs);
     }
